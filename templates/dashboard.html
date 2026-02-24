@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SLAM Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap');
+:root{
+  --bg:#060810;--card:#0d1117;--card2:#111820;--border:#1b2332;--text:#b8c4d4;
+  --dim:#3e4a5c;--blue:#3b82f6;--green:#10b981;--red:#ef4444;
+  --orange:#f59e0b;--cyan:#06b6d4;--purple:#a78bfa;--white:#e8ecf2
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}
+
+/* ── Top bar ── */
+.top{
+  padding:8px 14px;display:flex;align-items:center;justify-content:space-between;
+  background:rgba(13,17,23,.92);border-bottom:1px solid var(--border);
+  backdrop-filter:blur(10px);position:sticky;top:0;z-index:50
+}
+.top h1{font-size:.88rem;font-weight:700;color:#fff;display:flex;align-items:center;gap:6px}
+.pills{display:flex;gap:5px}
+.pill{
+  padding:2px 8px;border-radius:10px;font-size:.58rem;
+  font-family:'JetBrains Mono',monospace;font-weight:600;border:1px solid var(--border)
+}
+.pill.on{border-color:var(--green);color:var(--green)}
+.pill.off{border-color:#333;color:#444}
+
+/* ── Layouts ── */
+.main{display:grid;grid-template-columns:1fr 1.3fr 1fr;gap:6px;padding:6px}
+.bottom{display:grid;grid-template-columns:2fr 1fr;gap:6px;padding:0 6px 6px}
+@media(max-width:1000px){.main{grid-template-columns:1fr 1fr}.bottom{grid-template-columns:1fr}}
+@media(max-width:600px){.main{grid-template-columns:1fr}.bottom{grid-template-columns:1fr}}
+
+/* ── Cards ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.ch{
+  padding:6px 10px;font-size:.65rem;font-weight:600;color:var(--blue);
+  text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:5px
+}
+.ch .dot{width:5px;height:5px;border-radius:50%;background:var(--green)}
+.cb{padding:6px;display:flex;flex-direction:column;align-items:center}
+
+/* ── Camera feed ── */
+#cam_img{width:100%;display:block;border-radius:4px;background:#000;min-height:160px;object-fit:contain}
+#cam_ph{
+  min-height:160px;display:flex;align-items:center;justify-content:center;
+  color:var(--dim);font-size:.7rem;font-family:'JetBrains Mono',monospace;width:100%
+}
+
+/* ── Three.js container ── */
+#three_box{
+  width:100%;height:300px;position:relative;
+  background:#080a0e;border-radius:4px;cursor:grab
+}
+#three_box:active{cursor:grabbing}
+#three_box canvas{border-radius:4px}
+
+/* stream status badge */
+.sbadge{
+  position:absolute;top:8px;left:8px;font-size:.52rem;
+  font-family:'JetBrains Mono',monospace;font-weight:600;
+  padding:2px 8px;border-radius:6px;z-index:3;letter-spacing:.3px
+}
+.sbadge.live{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:var(--green)}
+.sbadge.stale{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);color:var(--orange)}
+.sbadge.dead{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);color:var(--red)}
+
+.thr_info{
+  position:absolute;bottom:8px;left:8px;font-size:.55rem;color:rgba(255,255,255,.3);
+  font-family:'JetBrains Mono',monospace;pointer-events:none;z-index:2
+}
+.legend{
+  position:absolute;top:8px;right:8px;font-size:.52rem;color:var(--dim);
+  font-family:'JetBrains Mono',monospace;z-index:2;display:flex;flex-direction:column;gap:3px
+}
+.legend div{display:flex;align-items:center;gap:4px}
+.legend .sq{width:7px;height:7px;border-radius:2px}
+
+/* ── 2-D map ── */
+#map_wrap{position:relative;width:100%;background:#080a0e;border-radius:4px;overflow:hidden}
+#map_canvas{width:100%;display:block;image-rendering:pixelated}
+.map_legend{
+  position:absolute;bottom:6px;left:8px;display:flex;gap:8px;font-size:.55rem;
+  font-family:'JetBrains Mono',monospace;color:var(--dim);z-index:2
+}
+.map_legend div{display:flex;align-items:center;gap:3px}
+.map_legend .sq{width:8px;height:8px;border-radius:1px}
+
+/* ── Radar ── */
+canvas.radar{display:block;margin:0 auto;max-width:100%;border-radius:50%}
+
+/* ── Status grid ── */
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:3px;width:100%}
+.si{padding:5px 7px;background:var(--card2);border-radius:5px;border:1px solid var(--border)}
+.si .sl{font-size:.52rem;color:var(--dim);font-family:'JetBrains Mono',monospace;text-transform:uppercase}
+.si .sv{font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;margin-top:1px}
+
+/* ── Zone rows ── */
+.zr{
+  display:flex;justify-content:space-between;padding:2px 5px;font-size:.6rem;
+  font-family:'JetBrains Mono',monospace;border-bottom:1px solid rgba(255,255,255,.02)
+}
+.zr.zd{color:var(--red);font-weight:700}
+.zr.zw{color:var(--orange)}
+
+/* ── Badges ── */
+.badge{
+  display:inline-block;padding:2px 8px;border-radius:10px;
+  font-size:.62rem;font-weight:600;font-family:'JetBrains Mono',monospace
+}
+.badge.ok    {background:rgba(16,185,129,.08);color:var(--green);border:1px solid rgba(16,185,129,.15)}
+.badge.warn  {background:rgba(245,158,11,.08);color:var(--orange);border:1px solid rgba(245,158,11,.15)}
+.badge.danger{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.15)}
+
+/* ── E-stop button ── */
+#estop{
+  position:fixed;bottom:12px;left:12px;width:44px;height:44px;border-radius:50%;
+  background:var(--red);border:2px solid #f87171;display:flex;align-items:center;
+  justify-content:center;font-size:1rem;cursor:pointer;z-index:100;
+  box-shadow:0 4px 20px rgba(239,68,68,.3)
+}
+</style>
+</head>
+<body>
+
+<!-- ── Top bar ── -->
+<div class="top">
+  <h1><span>🗺</span> SLAM Mapping</h1>
+  <div class="pills">
+    <div class="pill" id="p_cam">CAM</div>
+    <div class="pill" id="p_lid">LIDAR</div>
+    <div class="pill" id="p_imu">IMU</div>
+  </div>
+</div>
+
+<!-- ── Main row ── -->
+<div class="main">
+
+  <!-- Camera feed -->
+  <div class="card">
+    <div class="ch"><div class="dot" id="cd"></div>RealSense Camera</div>
+    <div class="cb">
+      <img id="cam_img" style="display:none">
+      <div id="cam_ph">Waiting for camera…</div>
+    </div>
+  </div>
+
+  <!-- 3-D viewer -->
+  <div class="card">
+    <div class="ch">
+      <div class="dot" id="stream_dot"></div>
+      3D Map &nbsp;
+      <span style="color:var(--dim);font-weight:400;font-size:.6rem">LiDAR walls + RealSense RGB</span>
+    </div>
+    <div class="cb" style="padding:0;position:relative">
+      <div id="three_box">
+        <div class="sbadge dead" id="sbadge">○ NO SIGNAL</div>
+        <div class="legend">
+          <div><div class="sq" style="background:#06c8d4;border:1px solid rgba(6,200,212,.4)"></div>LiDAR walls</div>
+          <div><div class="sq" style="background:linear-gradient(135deg,#f59e0b,#10b981,#3b82f6)"></div>Camera RGB</div>
+        </div>
+        <div class="thr_info" id="pc_info">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Radar -->
+  <div class="card">
+    <div class="ch"><div class="dot"></div>LiDAR Radar</div>
+    <div class="cb">
+      <canvas class="radar" id="radar" width="260" height="260"></canvas>
+      <div style="margin-top:5px;text-align:center">
+        <span class="badge ok" id="sbadge2">IDLE</span>
+        <span style="font-size:.6rem;color:var(--dim);margin-left:5px;font-family:'JetBrains Mono',monospace"
+              id="sdetail"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Bottom row ── -->
+<div class="bottom">
+
+  <!-- 2-D SLAM map -->
+  <div class="card">
+    <div class="ch"><div class="dot"></div>2D SLAM Map</div>
+    <div class="cb" style="padding:4px">
+      <div id="map_wrap">
+        <canvas id="map_canvas" width="600" height="600"></canvas>
+        <div class="map_legend">
+          <div><div class="sq" style="background:#c8cdd4"></div>Free</div>
+          <div><div class="sq" style="background:#0f0f14"></div>Wall</div>
+          <div><div class="sq" style="background:#121624"></div>Unknown</div>
+          <div><div class="sq" style="background:#10b981"></div>Trail</div>
+          <div><div class="sq" style="background:#ef4444"></div>Robot</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status + Zones -->
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <div class="card" style="flex:1">
+      <div class="ch"><div class="dot"></div>Status</div>
+      <div class="cb" style="align-items:stretch">
+        <div class="sg">
+          <div class="si"><div class="sl">Left RPM</div><div class="sv" style="color:var(--cyan)" id="ml">0</div></div>
+          <div class="si"><div class="sl">Right RPM</div><div class="sv" style="color:var(--cyan)" id="mr">0</div></div>
+          <div class="si"><div class="sl">LiDAR pts</div><div class="sv" style="color:var(--white)" id="lpts">0</div></div>
+          <div class="si"><div class="sl">Camera pts</div><div class="sv" style="color:var(--blue)" id="cpts">0</div></div>
+          <div class="si"><div class="sl">Position</div><div class="sv" style="color:var(--purple)" id="pos">0,0</div></div>
+          <div class="si"><div class="sl">IMU R/P/Y</div><div class="sv" id="imu">—</div></div>
+          <div class="si"><div class="sl">Target</div><div class="sv" style="color:var(--orange)" id="tgt">—</div></div>
+          <div class="si"><div class="sl">Frame</div><div class="sv" id="frm">0</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="flex:1">
+      <div class="ch"><div class="dot"></div>Zones</div>
+      <div class="cb" style="align-items:stretch" id="zones"></div>
+    </div>
+  </div>
+</div>
+
+<!-- E-stop -->
+<div id="estop"
+     onclick="fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({action:'stop'})})">⏹</div>
+
+<script>
+// ════════════════════════════════════════════════════════════════
+//  Three.js — Unified 3D viewer
+//  Base frame: X=forward  Y=left  Z=up
+//  Three.js world (Y-up): b2w(bx,by,bz) = [bx, bz, -by]
+// ════════════════════════════════════════════════════════════════
+function b2w(bx,by,bz){ return [bx, bz, -by]; }
+
+let scene, cam3, ren;
+let dragging=false, prev={x:0,y:0}, theta=0.6, phi=0.45, dist=6;
+let lastLiveTs=0;
+
+let camLiveMesh=null, camAccumMesh=null;
+let lidarWallPts=null, lidarLoopLine=null, lidarLivePts=null;
+let robotMarker=null;
+
+function init3D(){
+  const el=document.getElementById('three_box');
+  const w=el.clientWidth, h=el.clientHeight||300;
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0x06080e);
+  scene.fog=new THREE.FogExp2(0x06080e,0.045);
+  cam3=new THREE.PerspectiveCamera(50,w/h,0.05,120);
+  orbitCam();
+  ren=new THREE.WebGLRenderer({antialias:true});
+  ren.setSize(w,h);
+  ren.setPixelRatio(Math.min(window.devicePixelRatio,1.5));
+  el.appendChild(ren.domElement);
+  scene.add(new THREE.GridHelper(30,60,0x0d1a26,0x091320));
+  scene.add(new THREE.AxesHelper(0.4));
+  scene.add(new THREE.AmbientLight(0x112233,1));
+
+  ren.domElement.addEventListener('mousedown',e=>{dragging=true;prev={x:e.clientX,y:e.clientY}});
+  window.addEventListener('mouseup',()=>dragging=false);
+  window.addEventListener('mousemove',e=>{
+    if(!dragging)return;
+    theta+=(e.clientX-prev.x)*0.006;
+    phi=Math.max(0.04,Math.min(Math.PI*0.92,phi+(e.clientY-prev.y)*0.006));
+    prev={x:e.clientX,y:e.clientY};orbitCam();
+  });
+  ren.domElement.addEventListener('wheel',e=>{
+    dist=Math.max(1,Math.min(30,dist+e.deltaY*0.01));orbitCam();e.preventDefault();
+  },{passive:false});
+  let ts=null;
+  ren.domElement.addEventListener('touchstart',e=>{if(e.touches.length===1)ts={x:e.touches[0].clientX,y:e.touches[0].clientY}});
+  ren.domElement.addEventListener('touchmove',e=>{
+    if(!ts||e.touches.length!==1)return;
+    const t=e.touches[0];
+    theta+=(t.clientX-ts.x)*0.006;
+    phi=Math.max(0.04,Math.min(Math.PI*0.92,phi+(t.clientY-ts.y)*0.006));
+    ts={x:t.clientX,y:t.clientY};orbitCam();e.preventDefault();
+  },{passive:false});
+  ren.domElement.addEventListener('touchend',()=>ts=null);
+  (function loop(){requestAnimationFrame(loop);ren.render(scene,cam3);})();
+}
+
+function orbitCam(){
+  cam3.position.set(
+    dist*Math.sin(phi)*Math.cos(theta),
+    dist*Math.cos(phi),
+    dist*Math.sin(phi)*Math.sin(theta)
+  );
+  cam3.lookAt(0,0.5,0);
+}
+
+function disposeMesh(m){
+  if(!m)return;
+  scene.remove(m);
+  if(m.geometry)m.geometry.dispose();
+  if(m.material)m.material.dispose();
+}
+
+function makePoints(posArr,colorArr,ptSize,solidColor){
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(posArr,3));
+  let mat;
+  if(solidColor!==undefined){
+    mat=new THREE.PointsMaterial({size:ptSize,color:solidColor,sizeAttenuation:true,transparent:true,opacity:0.9});
+  } else {
+    g.setAttribute('color',new THREE.BufferAttribute(colorArr,3));
+    mat=new THREE.PointsMaterial({size:ptSize,vertexColors:true,sizeAttenuation:true});
+  }
+  return new THREE.Points(g,mat);
+}
+
+// ── Live frame (200 ms) ──────────────────────────────────────────
+function updateLive(data){
+  disposeMesh(camLiveMesh); camLiveMesh=null;
+  if(data.pts&&data.pts.length){
+    const pts=data.pts,n=pts.length;
+    const pos=new Float32Array(n*3),col=new Float32Array(n*3);
+    for(let i=0;i<n;i++){
+      const p=pts[i];
+      const[wx,wy,wz]=b2w(p[0],p[1],p[2]);
+      pos[i*3]=wx;pos[i*3+1]=wy;pos[i*3+2]=wz;
+      col[i*3]=p[3]/255;col[i*3+1]=p[4]/255;col[i*3+2]=p[5]/255;
+    }
+    camLiveMesh=makePoints(pos,col,0.004);
+    scene.add(camLiveMesh);
+    lastLiveTs=Date.now();
+  }
+  disposeMesh(lidarLivePts); lidarLivePts=null;
+  if(data.lidar_outline&&data.lidar_outline.length){
+    const ol=data.lidar_outline,n=ol.length;
+    const pos=new Float32Array(n*3);
+    for(let i=0;i<n;i++){
+      const[wx,wy,wz]=b2w(ol[i][0],ol[i][1],0);
+      pos[i*3]=wx;pos[i*3+1]=wy;pos[i*3+2]=wz;
+    }
+    lidarLivePts=makePoints(pos,null,0.018,0x22eeff);
+    scene.add(lidarLivePts);
+  }
+  refreshBadge(data.pts?data.pts.length:0);
+}
+
+// ── Accumulated map (3 s) ────────────────────────────────────────
+function updateMap3D(data){
+  disposeMesh(lidarWallPts); lidarWallPts=null;
+  if(data.lidar&&data.lidar.length){
+    const n=data.lidar.length,pos=new Float32Array(n*3);
+    for(let i=0;i<n;i++){
+      const d=data.lidar[i],[wx,wy,wz]=b2w(d[0],d[1],d[2]);
+      pos[i*3]=wx;pos[i*3+1]=wy;pos[i*3+2]=wz;
+    }
+    lidarWallPts=makePoints(pos,null,0.025,0x06c8d4);
+    scene.add(lidarWallPts);
+  }
+  disposeMesh(lidarLoopLine); lidarLoopLine=null;
+  if(data.lidar_loop&&data.lidar_loop.length>1){
+    const loop=data.lidar_loop,n=loop.length;
+    const heights=[0.02,0.55,1.10,1.65,2.10];
+    const group=new THREE.Group();
+    for(const h of heights){
+      const hPos=new Float32Array(n*3);
+      for(let i=0;i<n;i++){
+        const[wx,,wz]=b2w(loop[i][0],loop[i][1],h);
+        hPos[i*3]=wx;hPos[i*3+1]=h;hPos[i*3+2]=wz;
+      }
+      const hg=new THREE.BufferGeometry();
+      hg.setAttribute('position',new THREE.BufferAttribute(hPos,3));
+      group.add(new THREE.Line(hg,new THREE.LineBasicMaterial({
+        color:0x06c8d4,transparent:true,opacity:h<0.1||h>2.0?0.9:0.35
+      })));
+    }
+    lidarLoopLine=group;
+    scene.add(lidarLoopLine);
+  }
+  disposeMesh(camAccumMesh); camAccumMesh=null;
+  if(data.camera&&data.camera.length){
+    const n=data.camera.length,pos=new Float32Array(n*3),col=new Float32Array(n*3);
+    for(let i=0;i<n;i++){
+      const d=data.camera[i],[wx,wy,wz]=b2w(d[0],d[1],d[2]);
+      pos[i*3]=wx;pos[i*3+1]=wy;pos[i*3+2]=wz;
+      col[i*3]=d[3]/255;col[i*3+1]=d[4]/255;col[i*3+2]=d[5]/255;
+    }
+    camAccumMesh=makePoints(pos,col,0.028);
+    scene.add(camAccumMesh);
+  }
+}
+
+function updateRobot(pos,yaw){
+  if(robotMarker){scene.remove(robotMarker);robotMarker=null;}
+  const g=new THREE.ConeGeometry(0.08,0.22,6);
+  g.rotateX(Math.PI/2);
+  const m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0xef4444}));
+  m.position.set(pos[0],0.12,-pos[1]);
+  m.rotation.y=-yaw;
+  robotMarker=m;
+  scene.add(robotMarker);
+}
+
+function refreshBadge(camPts){
+  const age=Date.now()-lastLiveTs;
+  const b=document.getElementById('sbadge');
+  const d=document.getElementById('stream_dot');
+  if(lastLiveTs===0){
+    b.textContent='○ NO SIGNAL';b.className='sbadge dead';d.style.background='#ef4444';
+  } else if(age>2000){
+    b.textContent='◔ STALE';b.className='sbadge stale';d.style.background='#f59e0b';
+  } else {
+    b.textContent='● LIVE';b.className='sbadge live';d.style.background='#10b981';
+  }
+  const lc=lidarWallPts?lidarWallPts.geometry.attributes.position.count:0;
+  const ac=camAccumMesh?camAccumMesh.geometry.attributes.position.count:0;
+  document.getElementById('pc_info').textContent=
+    `cam:${(camPts||0).toLocaleString()}  map:${ac.toLocaleString()}  walls:${lc.toLocaleString()}`;
+}
+
+// ── 2-D occupancy map ────────────────────────────────────────────
+function drawMap(m){
+  if(!m||!m.grid)return;
+  const cv=document.getElementById('map_canvas'),x=cv.getContext('2d');
+  const sz=m.size;cv.width=sz;cv.height=sz;
+  const img=x.createImageData(sz,sz);
+  for(let i=0;i<m.grid.length;i++){
+    const v=m.grid[i],p=i*4;
+    if(v<0)    {img.data[p]=18; img.data[p+1]=22;  img.data[p+2]=32;  img.data[p+3]=255;}
+    else if(v===0){img.data[p]=200;img.data[p+1]=205;img.data[p+2]=212;img.data[p+3]=255;}
+    else if(v>=100){img.data[p]=15;img.data[p+1]=15;img.data[p+2]=20; img.data[p+3]=255;}
+    else       {img.data[p]=100;img.data[p+1]=105;img.data[p+2]=115;img.data[p+3]=255;}
+  }
+  x.putImageData(img,0,0);
+  if(m.trail&&m.trail.length>1){
+    const ox=m.origin[0],oy=m.origin[1],r=m.res;
+    x.beginPath();x.strokeStyle='rgba(16,185,129,.55)';x.lineWidth=1;
+    for(let i=0;i<m.trail.length;i++){
+      const px=(m.trail[i][0]-ox)/r,py=(m.trail[i][1]-oy)/r;
+      i===0?x.moveTo(px,py):x.lineTo(px,py);
+    }x.stroke();
+  }
+  if(m.robot){
+    const rx=(m.robot[0]-m.origin[0])/m.res,ry=(m.robot[1]-m.origin[1])/m.res,yaw=m.yaw||0;
+    x.save();x.translate(rx,ry);x.rotate(-yaw);
+    x.beginPath();x.moveTo(7,0);x.lineTo(-4,-4);x.lineTo(-2,0);x.lineTo(-4,4);x.closePath();
+    x.fillStyle='#ef4444';x.fill();x.strokeStyle='#fff';x.lineWidth=0.8;x.stroke();x.restore();
+    x.beginPath();x.arc(rx,ry,4,0,Math.PI*2);x.fillStyle='rgba(239,68,68,.25)';x.fill();
+  }
+}
+
+// ── LiDAR radar ──────────────────────────────────────────────────
+function drawRadar(d){
+  const cv=document.getElementById('radar'),x=cv.getContext('2d'),W=cv.width,C=W/2,R=C-14;
+  x.clearRect(0,0,W,W);
+  x.fillStyle='rgba(8,10,14,.95)';x.beginPath();x.arc(C,C,R+10,0,Math.PI*2);x.fill();
+  for(let i=1;i<=4;i++){
+    x.beginPath();x.arc(C,C,R*i/4,0,Math.PI*2);
+    x.strokeStyle='rgba(59,130,246,.04)';x.lineWidth=1;x.stroke();
+  }
+  for(let a=0;a<360;a+=45){
+    const r=a*Math.PI/180;
+    x.beginPath();x.moveTo(C,C);x.lineTo(C+R*Math.sin(r),C-R*Math.cos(r));
+    x.strokeStyle='rgba(59,130,246,.03)';x.stroke();
+  }
+  x.fillStyle='rgba(62,74,92,.5)';x.font='600 7px JetBrains Mono';x.textAlign='center';
+  ['F','R','B','L'].forEach((l,i)=>{
+    const a=i*90*Math.PI/180;
+    x.fillText(l,C+(R+9)*Math.sin(a),C-(R+9)*Math.cos(a)+3);
+  });
+  if(d.histogram){
+    const n=d.histogram.length,bs=360/n;
+    for(let i=0;i<n;i++){
+      const h=d.histogram[i],nr=Math.min(1,Math.max(.03,1-h/6000))*R;
+      const s=(i*bs-90)*Math.PI/180,e=((i+1)*bs-90)*Math.PI/180;
+      x.beginPath();x.moveTo(C,C);x.arc(C,C,nr,s,e);x.closePath();
+      x.fillStyle=h<300?'rgba(239,68,68,.16)':h<600?'rgba(245,158,11,.08)':'rgba(59,130,246,.02)';
+      x.fill();
+    }
+  }
+  if(d.points){
+    for(const[as,dist]of Object.entries(d.points)){
+      const a=parseFloat(as),rd=(a-90)*Math.PI/180,rr=Math.min(dist/6000,1)*R;
+      x.beginPath();x.arc(C+rr*Math.cos(rd),C+rr*Math.sin(rd),1.1,0,Math.PI*2);
+      x.fillStyle=dist<300?'rgba(239,68,68,.8)':dist<600?'rgba(245,158,11,.5)':'rgba(59,130,246,.25)';
+      x.fill();
+    }
+  }
+  if(d.target_heading>=0){
+    const a=(d.target_heading-90)*Math.PI/180,l=R*.55;
+    x.beginPath();x.moveTo(C,C);x.lineTo(C+l*Math.cos(a),C+l*Math.sin(a));
+    x.strokeStyle='rgba(6,182,212,.5)';x.lineWidth=2;x.stroke();
+  }
+  x.beginPath();x.arc(C,C,3,0,Math.PI*2);x.fillStyle='#3b82f6';x.fill();
+}
+
+// ── Polling ──────────────────────────────────────────────────────
+const ZN=["FRONT","FRONT_RIGHT","RIGHT","BACK_RIGHT","BACK","BACK_LEFT","LEFT","FRONT_LEFT"];
+let camOk=false;
+
+async function pollData(){
+  try{
+    const d=await(await fetch('/data')).json();
+    drawRadar(d);
+    const sb=document.getElementById('sbadge2');
+    sb.textContent=d.state||'?';
+    sb.className='badge'+(
+      d.state&&d.state.includes('EMER')?' danger':
+      (d.state==='TRAPPED'||d.state==='UNSTUCK')?' warn':' ok'
+    );
+    document.getElementById('sdetail').textContent=d.detail||'';
+    const z=d.zones||{};
+    let zh='';
+    ZN.forEach(n=>{
+      const v=z[n]||9999;
+      zh+=`<div class="zr${v<300?' zd':v<600?' zw':''}"><span>${n}</span><span>${v}mm</span></div>`;
+    });
+    document.getElementById('zones').innerHTML=zh;
+    document.getElementById('ml').textContent=d.left_rpm||0;
+    document.getElementById('mr').textContent=d.right_rpm||0;
+    document.getElementById('lpts').textContent=(d.lidar_pts||0).toLocaleString();
+    document.getElementById('cpts').textContent=(d.cam_pts||0).toLocaleString();
+    document.getElementById('tgt').textContent=d.target_heading>=0?d.target_heading.toFixed(0)+'°':'—';
+    document.getElementById('frm').textContent=d.frame||0;
+    const p=d.position||[0,0,0];
+    document.getElementById('pos').textContent=p[0].toFixed(1)+', '+p[1].toFixed(1);
+    if(d.imu)document.getElementById('imu').textContent=
+      d.imu.roll.toFixed(0)+' '+d.imu.pitch.toFixed(0)+' '+d.imu.yaw.toFixed(0);
+    document.getElementById('p_lid').className='pill '+(d.points&&Object.keys(d.points).length?'on':'off');
+    document.getElementById('p_imu').className='pill '+(d.imu?'on':'off');
+    document.getElementById('p_cam').className='pill '+(camOk?'on':'off');
+  }catch(e){}
+  setTimeout(pollData,200);
+}
+
+async function pollLive3D(){
+  try{
+    const d=await(await fetch('/stream3d')).json();
+    if(d)updateLive(d);
+  }catch(e){refreshBadge(0);}
+  setTimeout(pollLive3D,200);
+}
+
+async function pollMap3D(){
+  try{
+    const d=await(await fetch('/map3d')).json();
+    if(d&&(d.lidar||d.lidar_loop||d.camera))updateMap3D(d);
+  }catch(e){}
+  setTimeout(pollMap3D,3000);
+}
+
+async function pollCam(){
+  try{
+    const r=await fetch('/camera');
+    if(r.ok){
+      const b=await r.blob();
+      const img=document.getElementById('cam_img');
+      img.src=URL.createObjectURL(b);img.style.display='block';
+      document.getElementById('cam_ph').style.display='none';
+      camOk=true;document.getElementById('cd').style.background='var(--green)';
+    }else{camOk=false;document.getElementById('cd').style.background='var(--red)';}
+  }catch(e){camOk=false;}
+  setTimeout(pollCam,250);
+}
+
+async function pollMap2D(){
+  try{
+    const m=await(await fetch('/map')).json();
+    drawMap(m);
+    if(m&&m.robot)updateRobot(m.robot,m.yaw||0);
+  }catch(e){}
+  setTimeout(pollMap2D,1200);
+}
+
+init3D();
+window.addEventListener('resize',()=>{
+  const c=document.getElementById('three_box');
+  if(c&&ren){const w=c.clientWidth,h=c.clientHeight||300;ren.setSize(w,h);cam3.aspect=w/h;cam3.updateProjectionMatrix();}
+});
+pollData();pollCam();pollMap2D();pollLive3D();pollMap3D();
+</script>
+</body>
+</html>
