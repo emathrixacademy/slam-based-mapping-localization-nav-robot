@@ -327,9 +327,9 @@ class LoopClosureDetector:
     Verification: lightweight 2D point-to-point ICP.
     """
 
-    def __init__(self, n_bins: int = 72, sim_thresh: float = 0.85,
+    def __init__(self, n_bins: int = 72, sim_thresh: float = 0.80,
                  min_kf_dist: float = 0.5, min_kf_gap: int = 20,
-                 icp_max_dist: float = 0.4):
+                 icp_max_dist: float = 0.6):
         self._n_bins      = n_bins
         self._sim_thresh  = sim_thresh
         self._min_kf_dist = min_kf_dist
@@ -386,14 +386,24 @@ class LoopClosureDetector:
 
         desc = self._descriptor(scan)
 
+        # Try 4 canonical rotations (0°, 90°, 180°, 270°) of the query descriptor.
+        # The range histogram is heading-sensitive: a robot returning from the
+        # opposite direction produces a descriptor shifted by ~n_bins/2.
+        # Trying all quadrant rotations makes detection robust to return trips.
+        shifts = [0,
+                  self._n_bins // 4,
+                  self._n_bins // 2,
+                  3 * self._n_bins // 4]
+        rotated_descs = [np.roll(desc, s) for s in shifts]
+
         best_sim = self._sim_thresh
         best_idx = -1
         for i, (kf_pose, kf_desc, _) in enumerate(candidates):
-            sim = float(np.dot(desc, kf_desc))
+            sim = max(float(np.dot(rd, kf_desc)) for rd in rotated_descs)
             if sim > best_sim:
                 dist = math.hypot(pose_2d[0] - kf_pose[0],
                                   pose_2d[1] - kf_pose[1])
-                if dist < 3.0:
+                if dist < 5.0:
                     best_sim = sim
                     best_idx = i
 
@@ -405,7 +415,7 @@ class LoopClosureDetector:
             return None
 
         T4, fitness = self._icp_2d(pts_2d, kf_pts)
-        if fitness < 0.5:
+        if fitness < 0.4:
             return None
 
         # Correction = difference between ICP-refined pose and current pose

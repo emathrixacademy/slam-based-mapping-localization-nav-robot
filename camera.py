@@ -37,7 +37,7 @@ class RealSenseCamera:
                 try:
                     depth_sensor = profile.get_device().first_depth_sensor()
                     if depth_sensor.supports(rs.option.visual_preset):
-                        depth_sensor.set_option(rs.option.visual_preset, 3)  # High Density
+                        depth_sensor.set_option(rs.option.visual_preset, 3)  # High Accuracy
                     # Cache depth scale — avoids IPC call every frame
                     self._depth_scale = depth_sensor.get_depth_scale()
                 except Exception:
@@ -56,28 +56,39 @@ class RealSenseCamera:
         self.align = rs.align(rs.stream.color)
 
         # ── Depth post-processing pipeline ───────────────────────────
-        # Order: align → depth_to_disparity → spatial → temporal
-        #        → disparity_to_depth → hole_fill
+        # Intel-recommended order for D4xx series:
+        #   decimation → depth_to_disparity → spatial → temporal
+        #   → disparity_to_depth → hole_fill
         #
-        # Running spatial + temporal in DISPARITY space is critical:
-        # the filters are designed for disparity (1/depth), not raw depth.
-        # In disparity space, far objects have small values so the filter
-        # step-size thresholds behave consistently across the depth range.
+        # Decimation BEFORE disparity: reduces resolution first so the spatial
+        # filter operates on cleaner, larger pixels — significantly improves
+        # depth quality on planar surfaces like walls.
+        #
+        # Spatial + temporal run in DISPARITY space (1/depth): filter thresholds
+        # are consistent across the depth range so distant walls benefit equally.
+
+        # Decimation — magnitude=2 halves resolution, improves per-pixel SNR
+        # and dramatically reduces flying pixels at depth edges (wall corners).
+        self._decimation = rs.decimation_filter()
+        self._decimation.set_option(rs.option.filter_magnitude, 2)
+
         self._depth_to_disparity = rs.disparity_transform(True)
         self._disparity_to_depth = rs.disparity_transform(False)
 
-        # Spatial — edge-preserving fill, 3 passes for more hole coverage
+        # Spatial — edge-preserving fill; 4 passes + higher delta fills wall
+        # holes that result from low-texture surfaces (painted walls, etc.)
         self._spatial = rs.spatial_filter()
-        self._spatial.set_option(rs.option.filter_magnitude,    3)    # passes (1-5)
+        self._spatial.set_option(rs.option.filter_magnitude,    4)    # passes (1-5)
         self._spatial.set_option(rs.option.filter_smooth_alpha, 0.5)  # smoothing weight
-        self._spatial.set_option(rs.option.filter_smooth_delta, 20)   # step threshold
+        self._spatial.set_option(rs.option.filter_smooth_delta, 30)   # step threshold
 
-        # Temporal — blends up to 4 frames; alpha=0.4 gives strong smoothing
+        # Temporal — alpha=0.6 converges faster on static walls than 0.4;
+        # delta=30 matches the spatial setting for consistent behaviour.
         self._temporal = rs.temporal_filter()
-        self._temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
-        self._temporal.set_option(rs.option.filter_smooth_delta, 20)
+        self._temporal.set_option(rs.option.filter_smooth_alpha, 0.6)
+        self._temporal.set_option(rs.option.filter_smooth_delta, 30)
 
-        # Hole fill — nearest_from_around (2) best for object interior surfaces
+        # Hole fill — nearest_from_around (2) best for interior planar surfaces
         self._hole_fill = rs.hole_filling_filter()
         self._hole_fill.set_option(rs.option.holes_fill, 2)
 
@@ -94,7 +105,9 @@ class RealSenseCamera:
         color   = aligned.get_color_frame()
         if not depth or not color:
             return None, None
-        # Disparity-space filter pipeline (much better quality than raw-depth filtering)
+        # Filter pipeline: decimation first → disparity space → spatial →
+        # temporal → back to depth → hole fill.
+        depth = self._decimation.process(depth)
         depth = self._depth_to_disparity.process(depth)
         depth = self._spatial.process(depth)
         depth = self._temporal.process(depth)

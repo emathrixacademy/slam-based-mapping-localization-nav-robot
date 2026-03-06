@@ -296,7 +296,7 @@ class SLAMAvoidanceRobot:
         self._mesh_data      = None
         self._mesh_lock      = threading.Lock()
         self._mesh_building  = False
-        self.MESH_INTERVAL   = 10      # check for new geometry every N frames
+        self.MESH_INTERVAL   = 20      # check for new geometry every N frames
 
         # Accumulated mesh — BPA chunks from each new region, merged as robot explores
         self._acc_mesh_verts  = np.empty((0, 3), dtype=np.float32)
@@ -306,9 +306,9 @@ class SLAMAvoidanceRobot:
         # Finer than before → smaller patches → more detail per BPA chunk
         self.TRACK_VOXEL    = 0.05
         self._meshed_voxels = np.empty(0, dtype=np.int64)   # sorted
-        # Only mesh points whose optical-Z depth is within this range (metres).
-        # Lower bound keeps "in-flux" close points out; upper bound matches camera range.
-        self.MESH_MIN_DIST  = 1.5
+        # Maximum optical-Z depth (metres) for meshing.  Set to camera max_depth so
+        # walls at 2–5 m are included.  Previously 1.5 m silently excluded far walls.
+        self.MESH_MAX_DIST  = 5.0
 
         # ── IMU heading prediction state ──
         self._last_tick_time = time.time()   # for computing dt between ticks
@@ -608,7 +608,11 @@ class SLAMAvoidanceRobot:
             _turned = abs(hyaw - self._map_yaw)
             # Reject impossible jumps — robot physically can't move >6 cm per tick.
             # Hector drifting while stationary shows as large per-tick jumps → reject.
-            if _moved > 0.06:
+            # Exception: when Hector is very confident (fitness > 0.55) allow up to
+            # 25 cm — this lets Hector snap back to the map when the robot returns
+            # to a previously visited area with accumulated drift.
+            _max_jump = 0.25 if h_fitness > 0.55 else 0.06
+            if _moved > _max_jump:
                 self.hector.set_pose(_prev_x, _prev_y, self._map_yaw)
             # Accept only meaningful updates — filter sub-5mm/sub-0.5° scan jitter
             elif _moved > 0.005 or _turned > math.radians(0.5):
@@ -1142,8 +1146,8 @@ class SLAMAvoidanceRobot:
         from lidar import voxel_downsample_idx
 
         # ── Voxel downsample live frame ────────────────────────────────
-        BPA_MAX   = 16000   # more points → denser mesh per patch
-        BPA_VOXEL = 0.012   # finer than before → higher detail
+        BPA_MAX   = 12000   # balanced density vs. BPA runtime
+        BPA_VOXEL = 0.015   # 15 mm voxels — fine enough for walls at 4 m
 
         ds_idx    = voxel_downsample_idx(xyz_live.astype(np.float32), BPA_VOXEL)
         bpa_xyz   = xyz_live[ds_idx].astype(np.float64)
@@ -1156,12 +1160,14 @@ class SLAMAvoidanceRobot:
             bpa_depth = bpa_depth[ds2]
 
         # ── Depth gate ────────────────────────────────────────────────
-        near_mask = bpa_depth <= self.MESH_MIN_DIST
-        if not near_mask.any():
+        # Keep points from 0.1 m (near noise floor) up to MESH_MAX_DIST (5 m).
+        # This includes far walls — the old 1.5 m cap silently excluded them.
+        depth_mask = (bpa_depth >= 0.1) & (bpa_depth <= self.MESH_MAX_DIST)
+        if not depth_mask.any():
             self._mesh_building = False
             return
-        bpa_xyz   = bpa_xyz[near_mask]
-        bpa_depth = bpa_depth[near_mask]
+        bpa_xyz   = bpa_xyz[depth_mask]
+        bpa_depth = bpa_depth[depth_mask]
 
         # ── New-voxel gate — skip already-meshed cells ────────────────
         TRACK = self.TRACK_VOXEL   # 0.05 m — finer than old 0.08 m
@@ -1201,7 +1207,7 @@ class SLAMAvoidanceRobot:
         if len(acc_xyz) > 50:
             acc_xyz   = acc_xyz.copy()
             acc_depth = acc_depth.copy()
-            na        = acc_depth <= self.MESH_MIN_DIST
+            na        = (acc_depth >= 0.1) & (acc_depth <= self.MESH_MAX_DIST)
             acc_xyz   = acc_xyz[na].astype(np.float64)
             acc_depth = acc_depth[na]
             if len(acc_xyz) > 0:
@@ -1263,7 +1269,7 @@ class SLAMAvoidanceRobot:
         norm_radius = float(np.clip(mean_d * 10.0, 0.06, 0.40))
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=norm_radius, max_nn=100))
+                radius=norm_radius, max_nn=30))
         # Propagate normal consistency within the local patch first,
         # then orient all normals toward the camera for correct facing.
         try:
@@ -1291,7 +1297,7 @@ class SLAMAvoidanceRobot:
             mesh.remove_non_manifold_edges()
             mesh.remove_unreferenced_vertices()
             if len(np.asarray(mesh.vertices)) > 10:
-                mesh = mesh.filter_smooth_taubin(number_of_iterations=15)
+                mesh = mesh.filter_smooth_taubin(number_of_iterations=8)
             mesh.compute_vertex_normals()
         except Exception as e:
             print(f"[Mesh] BPA failed: {e}")
