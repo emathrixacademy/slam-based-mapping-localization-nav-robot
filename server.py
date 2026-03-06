@@ -5,11 +5,17 @@ Serves the static dashboard.html and JSON/JPEG API endpoints.
 Import and call start_dashboard(robot, port) from main.py.
 """
 import json
-import math
 import os
 import threading
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn, TCPServer
 from pathlib import Path
+
+
+class HTTPServer(ThreadingMixIn, TCPServer):
+    """Multi-threaded HTTP server — handles each request in its own thread."""
+    allow_reuse_address = True
+    daemon_threads = True
 
 # Absolute path to dashboard.html (same directory as this file)
 _HTML_PATH = Path(__file__).parent / "dashboard.html"
@@ -43,36 +49,32 @@ class DashHandler(SimpleHTTPRequestHandler):
                 self.send_header('Cache-Control', 'no-cache')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(jpeg)
+                try:
+                    self.wfile.write(jpeg)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             else:
                 self.send_response(204); self.end_headers()
 
         elif self.path == '/stream3d':
-            # Live: current base-frame camera points + current lidar scan outline
-            xyz, rgb = (_robot.get_live_frame() if _robot else (None, None))
-            pts = []
-            if xyz is not None and len(xyz) > 0:
-                pts = [
-                    [round(float(xyz[i,0]),3), round(float(xyz[i,1]),3), round(float(xyz[i,2]),3),
-                     int(rgb[i,0]),            int(rgb[i,1]),            int(rgb[i,2])]
-                    for i in range(len(xyz))
-                ]
-            lidar_outline = []
-            if _robot:
-                scan = _robot.lidar.get_scan()
-                for ang, dist_mm in scan.items():
-                    if 10 < dist_mm < 8000:
-                        rad = math.radians(float(ang))
-                        d   = dist_mm / 1000.0
-                        lidar_outline.append([
-                            round(d * math.cos(rad), 3),
-                            round(d * math.sin(rad), 3),
-                        ])
-            self._json({"pts": pts, "count": len(pts), "lidar_outline": lidar_outline})
+            # Serve pre-serialised payload built by the mapping loop
+            payload = _robot.get_stream3d_bytes() if _robot else b'{}'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         elif self.path == '/map3d':
             pts = _robot.get_map3d() if _robot else None
             self._json(pts or {})
+
+        elif self.path == '/mesh':
+            mesh = _robot.get_mesh() if _robot else None
+            self._json(mesh or {})
 
         elif self.path == '/calibrate':
             # Return current camera mounting angles
@@ -123,17 +125,26 @@ class DashHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
-        self.wfile.write(content.encode())
+        try:
+            self.wfile.write(content.encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _json(self, data):
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(json.dumps(data or {}, default=str).encode())
+        try:
+            self.wfile.write(json.dumps(data or {}, default=str).encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, *_):
         pass   # suppress request logs
+
+    def handle_error(self, request, client_address):
+        pass   # suppress all connection-level errors (BrokenPipe etc.)
 
 
 # ── Public entry point ────────────────────────────────────────────

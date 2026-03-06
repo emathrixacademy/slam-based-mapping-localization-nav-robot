@@ -24,8 +24,31 @@ import os
 import sys
 import glob
 import socket
+import subprocess
 
 from config import load_config
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Jetson performance mode (max clocks + max power)
+# ═══════════════════════════════════════════════════════════════════
+def _jetson_max_performance():
+    """
+    Enable Jetson Orin Nano maximum performance mode silently.
+    nvpmodel -m 0  → MAXN (all CPU + GPU cores, max TDP)
+    jetson_clocks   → pin clocks to maximum (no DVFS throttling)
+    Safe to call even if not running as root — commands will fail
+    gracefully and the robot still runs (just at lower throughput).
+    """
+    ok = []
+    for cmd in (["sudo", "nvpmodel", "-m", "0"],
+                ["sudo", "jetson_clocks"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=10)
+            ok.append(cmd[-1] if r.returncode == 0 else f"{cmd[-1]}(skip)")
+        except Exception:
+            ok.append(f"{cmd[-1]}(skip)")
+    print(f"[Jetson] Performance mode: {' | '.join(ok)}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -80,6 +103,7 @@ def run_check(config: dict):
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 def main():
+    _jetson_max_performance()
     config   = load_config("robot_config.json")
     args     = sys.argv[1:]
     map_only = "--map-only" in args

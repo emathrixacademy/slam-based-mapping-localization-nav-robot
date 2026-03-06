@@ -42,7 +42,11 @@ class LD06:
         current_raw  = {}
 
         while self._running:
-            incoming = self.ser.read(128)
+            # Read all bytes waiting in the OS buffer (min 1 packet = 47 bytes).
+            # Draining the full buffer each call avoids repeated tiny reads
+            # and reduces the number of system calls per second.
+            n_wait   = self.ser.in_waiting
+            incoming = self.ser.read(n_wait if n_wait >= 47 else 47)
             if not incoming:
                 continue
             self._buffer.extend(incoming)
@@ -118,9 +122,19 @@ class LD06:
         return hist
 
     def get_zone_distances(self, scan=None) -> dict:
+        _import_numpy()
+        from config import np
         if scan is None:
             scan = self.get_scan()
-        zones = {
+        _empty = {"FRONT":9999,"FRONT_RIGHT":9999,"RIGHT":9999,"BACK_RIGHT":9999,
+                  "BACK":9999,"BACK_LEFT":9999,"LEFT":9999,"FRONT_LEFT":9999}
+        if not scan:
+            return _empty
+        angles = np.fromiter(scan.keys(),   dtype=np.float32, count=len(scan))
+        dists  = np.fromiter(scan.values(), dtype=np.float32, count=len(scan))
+        valid  = dists > 0
+        angles = angles[valid]; dists = dists[valid]
+        zones  = {
             "FRONT":      (337.5, 22.5),
             "FRONT_RIGHT":(22.5,  67.5),
             "RIGHT":      (67.5,  112.5),
@@ -132,13 +146,8 @@ class LD06:
         }
         result = {}
         for name, (s, e) in zones.items():
-            dists = []
-            for a, d in scan.items():
-                if d <= 0: continue
-                in_zone = (a >= s or a < e) if s > e else (s <= a < e)
-                if in_zone:
-                    dists.append(d)
-            result[name] = min(dists) if dists else 9999
+            mask = (angles >= s) | (angles < e) if s > e else (angles >= s) & (angles < e)
+            result[name] = float(dists[mask].min()) if mask.any() else 9999
         return result
 
     def close(self):
@@ -152,32 +161,61 @@ class LD06:
 # ── Point-cloud utilities ─────────────────────────────────────────
 
 def lidar_to_3d(scan_dict: dict, height: float = 0.0):
-    """Convert {angle_deg: dist_mm} → Nx3 float32 array (x, y, height)."""
+    """Convert {angle_deg: dist_mm} → Nx3 float32 array (x, y, height).
+    Vectorised — ~50x faster than per-point Python loop.
+    CW angle convention: 0°=forward, 90°=right, 270°=left.
+    """
     _import_numpy()
     from config import np
-    pts = []
-    for ang, dist in scan_dict.items():
-        if 10 < dist < 12000:
-            rad = math.radians(float(ang))
-            d   = dist / 1000.0
-            pts.append([d * math.cos(rad), d * math.sin(rad), height])
-    return (np.array(pts, dtype=np.float32)
-            if pts else np.empty((0, 3), dtype=np.float32))
+    if not scan_dict:
+        return np.empty((0, 3), dtype=np.float32)
+    angles = np.fromiter(scan_dict.keys(),   dtype=np.float32, count=len(scan_dict))
+    dists  = np.fromiter(scan_dict.values(), dtype=np.float32, count=len(scan_dict))
+    valid  = (dists >= 20) & (dists < 12000)
+    angles = angles[valid];  dists = dists[valid]
+    if len(angles) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    rad = np.deg2rad(angles)
+    d   = dists * (1.0 / 1000.0)
+    pts = np.empty((len(d), 3), dtype=np.float32)
+    pts[:, 0] =  d * np.cos(rad)   # x = forward
+    pts[:, 1] = -d * np.sin(rad)   # y = left  (negate for CW)
+    pts[:, 2] =  height
+    return pts
 
 
 def transform_points(pts, T):
-    """Apply 4×4 homogeneous transform T to Nx3 point array."""
+    """Apply 4×4 homogeneous transform T to Nx3 point array. GPU-accelerated when CuPy is available."""
     if len(pts) == 0:
         return pts
-    from config import np
+    from config import np, cp, cuda_ok
+    if cuda_ok and cp is not None and len(pts) > 1000:
+        try:
+            g = cp.asarray(pts,        dtype=cp.float32)
+            R = cp.asarray(T[:3, :3],  dtype=cp.float32)
+            t = cp.asarray(T[:3, 3],   dtype=cp.float32)
+            return cp.asnumpy(g @ R.T + t).astype(np.float32)
+        except Exception:
+            pass
     return (pts @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
 
 
 def voxel_downsample(pts, voxel_size: float):
-    """Hash-based voxel grid downsampling — fast O(N)."""
+    """Hash-based voxel grid downsampling. GPU-accelerated when CuPy is available."""
     if len(pts) == 0:
         return pts
-    from config import np
+    from config import np, cp, cuda_ok
+    if cuda_ok and cp is not None and len(pts) > 500:
+        try:
+            g      = cp.asarray(pts)
+            keys   = (g / voxel_size).astype(cp.int64)
+            hashes = (keys[:, 0] * cp.int64(73856093)
+                      ^ keys[:, 1] * cp.int64(19349669)
+                      ^ keys[:, 2] * cp.int64(83492791))
+            _, idx = cp.unique(hashes, return_index=True)
+            return cp.asnumpy(g[idx])
+        except Exception:
+            pass
     keys   = (pts / voxel_size).astype(np.int64)
     hashes = (keys[:, 0] * 73856093
               ^ keys[:, 1] * 19349669
@@ -186,14 +224,39 @@ def voxel_downsample(pts, voxel_size: float):
     return pts[idx]
 
 
+def voxel_downsample_idx(pts, voxel_size: float):
+    """Returns index array for voxel downsampling — keeps parallel arrays (e.g. depth) in sync."""
+    if len(pts) == 0:
+        from config import np
+        return np.arange(0, dtype=np.int64)
+    from config import np, cp, cuda_ok
+    if cuda_ok and cp is not None and len(pts) > 500:
+        try:
+            g      = cp.asarray(pts)
+            keys   = (g / voxel_size).astype(cp.int64)
+            hashes = (keys[:, 0] * cp.int64(73856093)
+                      ^ keys[:, 1] * cp.int64(19349669)
+                      ^ keys[:, 2] * cp.int64(83492791))
+            _, idx = cp.unique(hashes, return_index=True)
+            return cp.asnumpy(idx)
+        except Exception:
+            pass
+    keys   = (pts / voxel_size).astype(np.int64)
+    hashes = (keys[:, 0] * 73856093
+              ^ keys[:, 1] * 19349669
+              ^ keys[:, 2] * 83492791)
+    _, idx = np.unique(hashes, return_index=True)
+    return idx
+
+
 def numpy_icp(source, target, max_iter=25, tol=1e-5, max_dist=0.5):
     """
-    Point-to-point ICP using scipy cKDTree.
-    Returns (T_4x4, fitness_ratio).
+    Point-to-point ICP.  Returns (T_4x4, fitness_ratio).
+    Tries Open3D CUDA tensor ICP first; falls back to CPU scipy cKDTree.
     """
     _import_numpy()
     _import_scipy()
-    from config import np, cKDTree
+    from config import np, cKDTree, o3d_cuda_ok, _import_o3d
 
     if len(source) < 50 or len(target) < 50:
         return np.eye(4, dtype=np.float64), 0.0
@@ -204,9 +267,39 @@ def numpy_icp(source, target, max_iter=25, tol=1e-5, max_dist=0.5):
     if len(src) < 30 or len(tgt) < 30:
         return np.eye(4, dtype=np.float64), 0.0
 
-    tree  = cKDTree(tgt)
-    T_acc = np.eye(4, dtype=np.float64)
-    src_w = src.copy()
+    # ── Open3D CUDA tensor ICP ────────────────────────────────────
+    if o3d_cuda_ok:
+        try:
+            _import_o3d()
+            from config import o3d
+            dev  = o3d.core.Device("CUDA:0")
+            f32  = o3d.core.float32
+            src_t = o3d.t.geometry.PointCloud(device=dev)
+            src_t.point.positions = o3d.core.Tensor(
+                src.astype(np.float32), dtype=f32, device=dev)
+            tgt_t = o3d.t.geometry.PointCloud(device=dev)
+            tgt_t.point.positions = o3d.core.Tensor(
+                tgt.astype(np.float32), dtype=f32, device=dev)
+            tgt_t.estimate_normals(max_nn=20, radius=0.3)
+            result = o3d.t.pipelines.registration.icp(
+                src_t, tgt_t, max_dist,
+                o3d.core.Tensor(np.eye(4, dtype=np.float32)),   # init on CPU
+                o3d.t.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.t.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=max_iter,
+                    relative_fitness=tol,
+                    relative_rmse=tol),
+            )
+            T_out   = result.transformation.numpy().astype(np.float64)
+            fitness = float(result.fitness)
+            return T_out, fitness
+        except Exception:
+            pass   # fall through to CPU ICP
+
+    # ── CPU fallback: point-to-point ICP via scipy cKDTree ────────
+    tree     = cKDTree(tgt)
+    T_acc    = np.eye(4, dtype=np.float64)
+    src_w    = src.copy()
     prev_err = float('inf')
 
     for _ in range(max_iter):

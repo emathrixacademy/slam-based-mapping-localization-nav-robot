@@ -11,17 +11,19 @@ import sys
 import time
 import random
 import threading
+import contextlib
 from collections import deque
 
 from config import (
-    _import_numpy, _import_cv2,
+    _import_numpy, _import_cv2, _import_o3d, _import_scipy, _import_cupy,
     build_camera_transform, build_lidar_transform,
 )
 from motors import DualMotors, probe_motor_ports
 from lidar  import (
     LD06, lidar_to_3d, transform_points,
-    voxel_downsample, numpy_icp, save_pcd,
+    voxel_downsample, voxel_downsample_idx, numpy_icp, save_pcd,
 )
+from slam import HectorSLAM2D, RGBDOdometry, LoopClosureDetector
 from imu    import ICM20948
 from camera import RealSenseCamera
 
@@ -99,8 +101,8 @@ class SLAMAvoidanceRobot:
     EMERGENCY_DIST = 200
     STOP_DIST      = 350
     SLOW_DIST      = 800
-    CRUISE_DIST    = 1500
-    OPEN_DIST      = 2500
+    CRUISE_DIST    = 2500
+    OPEN_DIST      = 5000
 
     # Timing
     REVERSE_TIME = 0.6
@@ -163,10 +165,19 @@ class SLAMAvoidanceRobot:
         # ── Camera ──
         self.camera = None
         try:
-            self.camera = RealSenseCamera(max_depth=3.0)
+            self.camera = RealSenseCamera(max_depth=6.0)
             print("[SLAM] Camera: RealSense online")
         except Exception as e:
             print(f"[SLAM] Camera not available: {e}")
+
+        # ── Camera frame buffer (background capture thread) ──
+        # get_full_frame() blocks ~67 ms waiting for the sensor — running it in a
+        # dedicated thread lets the main loop tick at LiDAR rate (~20 Hz) instead
+        # of being throttled to camera rate (15 fps).
+        self._cam_latest_xyz     = None   # last captured xyz (camera optical frame)
+        self._cam_latest_img     = None   # last captured BGR image
+        self._cam_latest_depth_m = None   # last captured depth map (HxW float32)
+        self._cam_frame_lock     = threading.Lock()
 
         # ── VFH ──
         self.vfh = VFHNavigator(self.VFH_BIN, self.VFH_THRESH, self.VFH_GAP)
@@ -175,26 +186,73 @@ class SLAMAvoidanceRobot:
         self.T_base_cam = build_camera_transform(config)
         self.T_base_lid = build_lidar_transform(config)
         self.T_map_base = np.eye(4, dtype=np.float64)
+
+        # ── IMU-assisted heading ──
+        # _map_yaw: robot heading in map frame (radians), updated from IMU yaw each tick.
+        # T_map_base rotation is kept consistent with this so the map stays floor-fixed
+        # even during turns where ICP fails.
+        self._map_yaw       = 0.0   # current heading in map frame (rad)
+        self._imu_yaw_ref   = None  # IMU yaw reading at last heading reset
+        self._imu_yaw_base  = 0.0   # map_yaw at last heading reset
         print(f"[SLAM] Camera transform: "
               f"pos=({config['CAMERA_X']:.2f},{config['CAMERA_Y']:.2f},{config['CAMERA_Z']:.2f})m  "
               f"yaw={config.get('CAMERA_YAW_DEG',0):.1f}° "
               f"pitch={config.get('CAMERA_PITCH_DEG',0):.1f}° "
               f"roll={config.get('CAMERA_ROLL_DEG',0):.1f}°")
 
+        # ── Hector SLAM 2D (primary odometry) ─────────────────────
+        self.hector         = HectorSLAM2D(res=0.05, size=600, levels=3)
+        self._hector_frames = 0   # bootstrap guard (needs ≥5 map updates)
+
+        # ── RGB-D Visual Odometry (backup / Z-axis) ───────────────
+        self.rgbd_odom = None
+        if self.camera:
+            try:
+                fx, fy, cx, cy_, w, h = self.camera.get_intrinsics()
+                self.rgbd_odom = RGBDOdometry(w, h, fx, fy, cx, cy_,
+                                              depth_trunc=3.0)
+                print(f"[SLAM] RGB-D odometry: {w}×{h} "
+                      f"fx={fx:.1f} fy={fy:.1f}")
+            except Exception as e:
+                print(f"[SLAM] RGB-D odometry unavailable: {e}")
+
+        # ── Loop closure (runs in background) ─────────────────────
+        self.loop_det         = LoopClosureDetector()
+        self._loop_building   = False
+        self._loop_correction = None   # np.array[dx, dy, dyaw] or None
+        self._loop_lock       = threading.Lock()
+
+        # ── TSDF 3-D volume fusion (replaces BPA on accumulated points) ─
+        self._tsdf           = None
+        self._tsdf_intrinsic = None
+        self._tsdf_lock      = threading.Lock()
+        # TSDF (ScalableTSDFVolume) disabled — uses CUDA internally and
+        # segfaults on Jetson Orin Nano when GPU memory is under pressure.
+        # BPA full-rebuild is used for meshing instead.
+        self._tsdf           = None
+        self._tsdf_intrinsic = None
+
         # ── Map state ──
         self.map_points  = np.empty((0, 3), dtype=np.float32)
         self.lidar_map   = np.empty((0, 3), dtype=np.float32)
-        self.cam_map_xyz = np.empty((0, 3), dtype=np.float32)
-        self.cam_map_rgb = np.empty((0, 3), dtype=np.uint8)
+        self.cam_map_xyz   = np.empty((0, 3), dtype=np.float32)
+        self.cam_map_depth = np.empty((0,),   dtype=np.float32)  # raw optical-Z depth per point
         self.robot_trail = []
-        self.prev_cloud  = None
         self.frame_count = 0
 
-        # ── Occupancy grid ──
-        self.OCC_RES    = 0.05
-        self.OCC_SIZE   = 600
-        self.OCC_ORIGIN = np.array([-15.0, -15.0])
-        self.log_odds   = np.zeros((self.OCC_SIZE, self.OCC_SIZE), dtype=np.float32)
+        # ── Occupancy grid (60 m × 60 m @ 2.5 cm/cell) ──
+        self.OCC_RES    = 0.025
+        self.OCC_SIZE   = 2400
+        self.OCC_ORIGIN = np.array([-30.0, -30.0])
+        from config import cuda_ok
+        if cuda_ok:
+            import cupy as cp
+            self.log_odds = cp.zeros((self.OCC_SIZE, self.OCC_SIZE), dtype=cp.float32)
+            self._gpu_occ = True
+            print("[SLAM] Occupancy grid: GPU (CuPy — persistent, zero-copy UMA)")
+        else:
+            self.log_odds = np.zeros((self.OCC_SIZE, self.OCC_SIZE), dtype=np.float32)
+            self._gpu_occ = False
         self.L_OCC = 0.85;  self.L_FREE = -0.42
         self.L_MAX = 5.0;   self.L_MIN  = -5.0
 
@@ -208,17 +266,65 @@ class SLAMAvoidanceRobot:
         self._last_turn_dir  = 0
         self._turn_persist   = 0
 
+        # ── Perimeter exploration ──────────────────────────────────
+        # Phase 1: stay still for INIT_SCAN_FRAMES to build the initial room map.
+        # Phase 2: navigate generated waypoints around the inner edge of the room.
+        self.INIT_SCAN_FRAMES = 5       # ~0.25 s at 20 Hz — enough for stable map
+        _rl = config.get("ROBOT_LENGTH", 0.370)
+        _rw = config.get("ROBOT_WIDTH",  0.305)
+        self.robot_length = _rl
+        self.robot_width  = _rw
+        # WALL_MARGIN = robot half-diagonal + 0.15 m safety buffer
+        import math as _m
+        self.WALL_MARGIN  = round(_m.sqrt((_rl/2)**2 + (_rw/2)**2) + 0.15, 3)
+        self.WP_REACH_DIST = max(0.30, _rw / 2 + 0.10)   # metres — waypoint considered reached
+        self.WP_TIMEOUT       = 25.0    # seconds — skip stuck waypoint
+        self._perim_waypoints  = []     # [wx, wy] list in world frame
+        self._perim_wp_idx     = 0
+        self._perim_done       = False
+        self._perim_wp_t0      = 0.0    # time we started heading for current wp
+
         # ── Dashboard buffers ──
         self._dash_data  = {}; self._dash_lock  = threading.Lock()
         self._occ_grid   = None; self._occ_lock = threading.Lock()
         self._cam_jpeg   = None; self._cam_lock = threading.Lock()
         self._map3d_data = None; self._map3d_lock = threading.Lock()
 
-        # ── Live 3-D stream buffer (single raw frame in base frame) ──
-        self._live_frame_xyz  = None   # Nx3 float32
-        self._live_frame_rgb  = None   # Nx3 uint8
-        self._live_frame_lock = threading.Lock()
+        # ── Mesh reconstruction buffer ──
+        # Rebuilt incrementally in background every MESH_INTERVAL frames.
+        self._mesh_data      = None
+        self._mesh_lock      = threading.Lock()
+        self._mesh_building  = False
+        self.MESH_INTERVAL   = 10      # check for new geometry every N frames
 
+        # Accumulated mesh — BPA chunks from each new region, merged as robot explores
+        self._acc_mesh_verts  = np.empty((0, 3), dtype=np.float32)
+        self._acc_mesh_faces  = np.empty((0, 3), dtype=np.int32)
+        self._acc_mesh_colors = np.empty((0, 3), dtype=np.float32)
+        # Voxel tracking: packed int64 keys of world cells already BPA'd (0.08 m grid)
+        self.TRACK_VOXEL    = 0.08
+        self._meshed_voxels = np.empty(0, dtype=np.int64)   # sorted
+        # Only mesh points whose optical-Z depth is within this range (metres).
+        # Lower bound keeps "in-flux" close points out; upper bound matches camera range.
+        self.MESH_MIN_DIST  = 1.5
+
+        # ── IMU heading prediction state ──
+        self._last_tick_time = time.time()   # for computing dt between ticks
+        # Hector motion gate: only update map when robot has moved ≥3 cm or ≥2°
+        self._last_map_update_pose = np.array([0.0, 0.0, 0.0])  # [x, y, yaw]
+
+        # ── Live 3-D stream buffer (single raw frame in base frame) ──
+        self._live_frame_xyz   = None   # Nx3 float32
+        self._live_frame_depth = None   # N   float32  (optical-Z depth, metres)
+        self._live_frame_lock  = threading.Lock()
+
+        # ── Pre-serialised stream3d payload (served directly by HTTP thread) ──
+        self._stream3d_cache      = b'{}'
+        self._stream3d_cache_lock = threading.Lock()
+
+        # ── GPU acceleration (CuPy + Open3D CUDA) ──
+        _import_cupy()
+        _import_o3d()   # also checks o3d_cuda_ok
         print("[SLAM] Ready!")
 
     # ── Motor helpers ─────────────────────────────────────────────
@@ -276,6 +382,45 @@ class SLAMAvoidanceRobot:
         time.sleep(0.5 + random.random() * 0.8)
         self._front_history.clear()
 
+    # ── Background camera capture ─────────────────────────────────
+    def _camera_loop(self):
+        """
+        Dedicated thread: calls get_full_frame() continuously so the main loop
+        never blocks waiting for the camera sensor (~67 ms/frame at 15 fps).
+        The latest frame is stored in _cam_latest_* and read by _mapping_tick.
+        """
+        while self._running:
+            if self.camera is None:
+                break
+            try:
+                xyz, _rgb, img, depth_m = self.camera.get_full_frame()
+                if xyz is not None:
+                    with self._cam_frame_lock:
+                        self._cam_latest_xyz     = xyz
+                        self._cam_latest_img     = img
+                        self._cam_latest_depth_m = depth_m
+            except Exception:
+                time.sleep(0.05)
+
+    # ── GPU-accelerated transform (main-thread only, safe on Jetson UMA) ────
+    def _xform(self, pts, T):
+        """
+        transform_points with CuPy acceleration for large arrays.
+        On Jetson Orin Nano the CPU/GPU share unified memory — cp.asarray /
+        cp.asnumpy are near-zero-cost remaps, not DMA copies.
+        Only use from the MAIN thread; background threads must call transform_points().
+        """
+        from config import cuda_ok
+        if cuda_ok and len(pts) > 1000:
+            import cupy as cp
+            pts_cp = cp.asarray(pts, dtype=cp.float32)
+            T_cp   = cp.asarray(T,   dtype=cp.float32)
+            ones   = cp.ones((len(pts_cp), 1), dtype=cp.float32)
+            hom    = cp.hstack([pts_cp, ones])
+            result = (T_cp[:3, :] @ hom.T).T
+            return cp.asnumpy(result)
+        return transform_points(pts, T)
+
     # ── Mapping tick ──────────────────────────────────────────────
     def _mapping_tick(self):
         """One mapping cycle: read sensors → update live stream → ICP → accumulate map."""
@@ -288,56 +433,209 @@ class SLAMAvoidanceRobot:
             try: imu_data = self.imu.read_all()
             except Exception: pass
 
-        # LiDAR → base frame
-        scan    = self.lidar.get_scan()
-        lid_3d  = lidar_to_3d(scan, height=0.0)   # Z=0 in sensor frame; T adds height
+        # LiDAR → base frame, then filter robot-body reflections (< 150 mm)
+        scan     = self.lidar.get_scan()
+        lid_3d   = lidar_to_3d(scan, height=0.0)
         lid_base = (transform_points(lid_3d, self.T_base_lid)
                     if len(lid_3d) > 0 else lid_3d)
+        if len(lid_base) > 0:
+            horiz = np.linalg.norm(lid_base[:, :2], axis=1)
+            keep  = horiz >= 0.15
+            lid_base = lid_base[keep]
 
-        # Camera → base frame (with correct optical axis remap via T_base_cam)
-        cam_base = np.empty((0, 3), dtype=np.float32)
-        cam_rgb  = np.empty((0, 3), dtype=np.uint8)
-        cam_img  = None
+        # Camera → base frame (read latest frame from background capture thread)
+        cam_base  = np.empty((0, 3), dtype=np.float32)
+        cam_depth = np.empty((0,),   dtype=np.float32)  # optical-Z depth (metres)
+        cam_img   = None
+        depth_m   = None   # raw depth in metres for RGB-D odometry
         if self.camera:
-            try:
-                cam_xyz, cam_colors, cam_img = self.camera.get_colored_points_and_image()
-                if cam_xyz is not None and len(cam_xyz) > 0:
-                    cam_base = transform_points(cam_xyz, self.T_base_cam)
-                    cam_rgb  = cam_colors
-            except Exception:
-                pass
+            with self._cam_frame_lock:
+                cam_xyz = self._cam_latest_xyz
+                cam_img = self._cam_latest_img
+                depth_m = self._cam_latest_depth_m
+            if cam_xyz is not None and len(cam_xyz) > 0:
+                cam_base  = self._xform(cam_xyz, self.T_base_cam)
+                cam_depth = cam_xyz[:, 2].astype(np.float32)  # Z = depth in optical frame
 
-        # Live stream snapshot (base frame, up to 40k points)
-        with self._live_frame_lock:
-            if len(cam_base) > 0:
-                step = max(1, len(cam_base) // 40000)
-                self._live_frame_xyz = cam_base[::step].copy()
-                self._live_frame_rgb = cam_rgb[::step].copy()
-            else:
-                self._live_frame_xyz = None
-                self._live_frame_rgb = None
+        # Downsample camera for map accumulation (also caps live-view bandwidth)
+        if len(cam_base) > 40000:
+            step      = len(cam_base) // 40000
+            cam_base  = cam_base[::step]
+            cam_depth = cam_depth[::step]
 
-        # Downsample camera for map accumulation
-        if len(cam_base) > 20000:
-            step    = len(cam_base) // 20000
-            cam_base = cam_base[::step]
-            cam_rgb  = cam_rgb[::step]
-
-        # ICP odometry
-        parts = [p for p in [cam_base, lid_base] if len(p) > 0]
-        if not parts:
+        # Must have at least LiDAR or camera to proceed
+        if len(lid_base) == 0 and len(cam_base) == 0:
             return scan, imu_data, cam_img
-        fused = np.vstack(parts) if len(parts) > 1 else parts[0]
-        fused = voxel_downsample(fused, 0.03)
 
-        if self.prev_cloud is not None and len(fused) > 50:
+        lid_world = np.empty((0, 3), dtype=np.float32)   # filled after pose update
+
+        # ── RGB-D Visual Odometry (6-DOF backup / Z-axis) ─────────
+        T_rgbd_cam = np.eye(4, dtype=np.float64)
+        rgbd_ok    = False
+        if self.rgbd_odom is not None and depth_m is not None and cam_img is not None:
             try:
-                dT, fitness = numpy_icp(fused, self.prev_cloud, max_dist=0.5)
-                if fitness > 0.3:
-                    self.T_map_base = self.T_map_base @ np.linalg.inv(dT)
+                T_rgbd_cam, rgbd_ok = self.rgbd_odom.push_frame(cam_img, depth_m)
             except Exception:
                 pass
-        self.prev_cloud = fused.copy()
+
+        # ── IMU gyro heading prediction ────────────────────────────
+        # (1) Seeds Hector with a better starting yaw before registration
+        # (2) Acts as fallback pose update when Hector fitness is low
+        now = time.time()
+        dt  = min(now - self._last_tick_time, 0.5)   # cap at 500 ms (sanity)
+        self._last_tick_time = now
+        imu_predicted_yaw = None
+        if imu_data is not None and dt > 0:
+            gz  = float(imu_data["gyro"][2])
+            gz *= self.config.get("IMU_GYRO_SIGN", 1.0)
+            if abs(gz) < 0.03:    # 1.7°/s deadband — wider to kill bias drift at rest
+                gz = 0.0
+            imu_predicted_yaw = self._map_yaw + gz * dt
+            if self._hector_frames >= 5:
+                self.hector.set_pose(
+                    float(self.T_map_base[0, 3]),
+                    float(self.T_map_base[1, 3]),
+                    imu_predicted_yaw)
+
+        # ── Hector SLAM 2D (primary odometry: scan-to-map) ────────
+        h_fitness = 0.0
+        if len(lid_base) >= 20 and self._hector_frames >= 5:
+            scan_2d   = lid_base[:, :2].astype(np.float64)
+            h_fitness = self.hector.register(scan_2d)
+
+        # ── Apply best available pose update ──────────────────────
+        if h_fitness > 0.35:
+            # Hector SLAM wins: update T_map_base from 2D pose
+            hx, hy, hyaw = self.hector.get_pose()
+            _prev_x = float(self.T_map_base[0, 3])
+            _prev_y = float(self.T_map_base[1, 3])
+            _moved  = math.hypot(hx - _prev_x, hy - _prev_y)
+            _turned = abs(hyaw - self._map_yaw)
+            # Reject impossible jumps — robot physically can't move >6 cm per tick.
+            # Hector drifting while stationary shows as large per-tick jumps → reject.
+            if _moved > 0.06:
+                self.hector.set_pose(_prev_x, _prev_y, self._map_yaw)
+            # Accept only meaningful updates — filter sub-5mm/sub-0.5° scan jitter
+            elif _moved > 0.005 or _turned > math.radians(0.5):
+                cy_, sy_ = math.cos(hyaw), math.sin(hyaw)
+                self.T_map_base[0, 0] =  cy_; self.T_map_base[0, 1] = -sy_
+                self.T_map_base[1, 0] =  sy_; self.T_map_base[1, 1] =  cy_
+                self.T_map_base[0, 3] =  hx;  self.T_map_base[1, 3] =  hy
+                self._map_yaw = hyaw
+        elif imu_predicted_yaw is not None:
+            # IMU fallback: only apply if yaw actually changed (gz passed deadband)
+            # This prevents gyro bias from drifting the pose when stationary
+            dyaw = abs(imu_predicted_yaw - self._map_yaw)
+            if dyaw > math.radians(1.0):   # must turn > 1° to trigger IMU update
+                hyaw = imu_predicted_yaw
+                cy_, sy_ = math.cos(hyaw), math.sin(hyaw)
+                self.T_map_base[0, 0] =  cy_; self.T_map_base[0, 1] = -sy_
+                self.T_map_base[1, 0] =  sy_; self.T_map_base[1, 1] =  cy_
+                self._map_yaw = hyaw
+                self.hector.set_pose(float(self.T_map_base[0, 3]),
+                                     float(self.T_map_base[1, 3]), hyaw)
+        elif rgbd_ok:
+            # RGB-D backup: camera-frame delta → base-frame delta
+            T_cam_base   = np.linalg.inv(self.T_base_cam)
+            T_base_delta = self.T_base_cam @ np.linalg.inv(T_rgbd_cam) @ T_cam_base
+            self.T_map_base = self.T_map_base @ T_base_delta
+            self._map_yaw   = float(math.atan2(
+                self.T_map_base[1, 0], self.T_map_base[0, 0]))
+            self.hector.set_pose(float(self.T_map_base[0, 3]),
+                                 float(self.T_map_base[1, 3]), self._map_yaw)
+
+        # ── Apply pending loop-closure correction (from background) ─
+        with self._loop_lock:
+            corr = self._loop_correction
+            self._loop_correction = None
+        if corr is not None:
+            dx, dy, dyaw = corr
+            self.T_map_base[0, 3] += dx
+            self.T_map_base[1, 3] += dy
+            self._map_yaw += dyaw
+            cy_, sy_ = math.cos(self._map_yaw), math.sin(self._map_yaw)
+            self.T_map_base[0, 0] =  cy_; self.T_map_base[0, 1] = -sy_
+            self.T_map_base[1, 0] =  sy_; self.T_map_base[1, 1] =  cy_
+            self.hector.set_pose(float(self.T_map_base[0, 3]),
+                                 float(self.T_map_base[1, 3]), self._map_yaw)
+
+        # ── Update Hector map from world-frame LiDAR points ───────
+        # Motion gate: only update the map if the robot has moved ≥3 cm or
+        # rotated ≥2° — prevents vibration from smearing occupied cells.
+        if len(lid_base) > 0:
+            lid_world = transform_points(lid_base, self.T_map_base)
+            _cx = float(self.T_map_base[0, 3])
+            _cy = float(self.T_map_base[1, 3])
+            _moved = math.hypot(_cx - self._last_map_update_pose[0],
+                                 _cy - self._last_map_update_pose[1])
+            _rotated = abs(self._map_yaw - self._last_map_update_pose[2])
+            if _moved > 0.03 or _rotated > math.radians(2) or self._hector_frames < 10:
+                self.hector.update_map(lid_world[:, :2])
+                self._hector_frames += 1
+                self._last_map_update_pose = np.array([_cx, _cy, self._map_yaw])
+
+        # ── Loop closure: keyframe + detection (background thread) ─
+        if (self.frame_count % 30 == 0 and not self._loop_building
+                and len(lid_base) > 0):
+            self._loop_building = True
+            pose_snap = self.hector.get_pose()
+            scan_snap = dict(scan)
+            pts_snap  = lid_base[:, :2].copy()
+            self.loop_det.maybe_add_keyframe(pose_snap, scan_snap, pts_snap)
+
+            def _run_lc():
+                result = self.loop_det.detect(pose_snap, scan_snap, pts_snap)
+                if result is not None:
+                    _, corr_lc = result
+                    with self._loop_lock:
+                        self._loop_correction = corr_lc
+                    print(f"\n[LC] Loop closed — correction "
+                          f"Δx={corr_lc[0]:.2f} Δy={corr_lc[1]:.2f} "
+                          f"Δyaw={math.degrees(corr_lc[2]):.1f}°")
+                self._loop_building = False
+            threading.Thread(target=_run_lc, daemon=True).start()
+
+        # TSDF integration removed — using BPA full-rebuild instead
+
+        # ── Live stream in world frame (pose already updated) ──────
+        # LiDAR: angle-sort world-frame scan points so polyline closes correctly
+        _lidar_scan_world = []
+        if len(lid_world) > 0:
+            rx = float(self.T_map_base[0, 3])
+            ry = float(self.T_map_base[1, 3])
+            rel = lid_world[:, :2] - np.array([rx, ry], dtype=np.float32)
+            order = np.argsort(np.arctan2(rel[:, 1], rel[:, 0]))
+            _lidar_scan_world = [[round(float(lid_world[i, 0]), 3),
+                                   round(float(lid_world[i, 1]), 3)]
+                                  for i in order]
+        # Camera: world-frame live cloud
+        _cam_world_live = (self._xform(cam_base, self.T_map_base)
+                           if len(cam_base) > 0 else None)
+        with self._live_frame_lock:
+            self._live_frame_xyz   = _cam_world_live
+            self._live_frame_depth = cam_depth if _cam_world_live is not None else None
+        _pts = []
+        if _cam_world_live is not None and len(_cam_world_live) > 0:
+            # Cap stream payload to 20k pts for bandwidth; full 40k goes to mesh
+            _stream_xyz = _cam_world_live
+            _stream_dep = cam_depth[:len(_cam_world_live)]
+            if len(_stream_xyz) > 20000:
+                _s = len(_stream_xyz) // 20000
+                _stream_xyz = _stream_xyz[::_s]
+                _stream_dep = _stream_dep[::_s]
+            _xyz_r = np.round(_stream_xyz.astype(np.float32), 3)
+            _dep_r = np.round(_stream_dep.astype(np.float32), 3).reshape(-1, 1)
+            _pts = np.hstack([_xyz_r, _dep_r]).tolist()
+        import json as _json
+        _rx   = round(float(self.T_map_base[0, 3]), 3)
+        _ry   = round(float(self.T_map_base[1, 3]), 3)
+        _ryaw = round(float(self._map_yaw), 4)
+        _payload = _json.dumps({"pts": _pts, "count": len(_pts),
+                                 "lidar_scan": _lidar_scan_world,
+                                 "robot_x": _rx, "robot_y": _ry,
+                                 "robot_yaw": _ryaw}).encode()
+        with self._stream3d_cache_lock:
+            self._stream3d_cache = _payload
 
         # Robot trail
         pos = self.T_map_base[:3, 3]
@@ -348,50 +646,50 @@ class SLAMAvoidanceRobot:
             if len(self.robot_trail) > 5000:
                 self.robot_trail = self.robot_trail[-5000:]
 
-        # Accumulate LiDAR wall map
-        if len(lid_base) > 0:
-            lid_world = transform_points(lid_base, self.T_map_base)
+        # Accumulate LiDAR wall map (lid_world already in world frame from pose block)
+        if len(lid_world) > 0:
             self.lidar_map = (np.vstack([self.lidar_map, lid_world])
-                              if len(self.lidar_map) > 0 else lid_world)
+                              if len(self.lidar_map) > 0 else lid_world.copy())
 
-        # Accumulate camera coloured map
+        # Accumulate camera depth map — pre-downsample each new batch so only
+        # unique voxels enter the map (prevents runaway 22k-pts/frame growth).
         if len(cam_base) > 0:
-            cam_world = transform_points(cam_base, self.T_map_base)
+            cam_world    = self._xform(cam_base, self.T_map_base)
+            ds_idx       = voxel_downsample_idx(cam_world, self.MAP_VOXEL)
+            cam_world    = cam_world[ds_idx]
+            cam_depth_ds = cam_depth[ds_idx]
             self.cam_map_xyz = (np.vstack([self.cam_map_xyz, cam_world])
                                 if len(self.cam_map_xyz) > 0 else cam_world)
-            self.cam_map_rgb = (np.vstack([self.cam_map_rgb, cam_rgb])
-                                if len(self.cam_map_rgb) > 0 else cam_rgb)
+            self.cam_map_depth = (np.concatenate([self.cam_map_depth, cam_depth_ds])
+                                  if len(self.cam_map_depth) > 0 else cam_depth_ds)
 
-        parts_all = [p for p in [self.lidar_map, self.cam_map_xyz] if len(p) > 0]
-        self.map_points = (np.vstack(parts_all) if len(parts_all) > 1
-                           else (parts_all[0] if parts_all
-                                 else np.empty((0, 3), dtype=np.float32)))
-
-        # Periodic voxel downsample
+        # Periodic voxel downsample (merges duplicates across frames)
         if self.frame_count % 20 == 0:
             if len(self.lidar_map) > 0:
                 self.lidar_map = voxel_downsample(self.lidar_map, self.MAP_VOXEL)
             if len(self.cam_map_xyz) > 0:
-                keys = (self.cam_map_xyz / self.MAP_VOXEL).astype(np.int64)
-                hashes = keys[:,0]*73856093 ^ keys[:,1]*19349669 ^ keys[:,2]*83492791
-                _, idx = np.unique(hashes, return_index=True)
-                self.cam_map_xyz = self.cam_map_xyz[idx]
-                self.cam_map_rgb = self.cam_map_rgb[idx]
+                idx = voxel_downsample_idx(self.cam_map_xyz, self.MAP_VOXEL)
+                self.cam_map_xyz   = self.cam_map_xyz[idx]
+                self.cam_map_depth = self.cam_map_depth[idx]
 
         # Cap sizes
         if len(self.lidar_map) > 200_000:
             self.lidar_map = voxel_downsample(self.lidar_map, self.MAP_VOXEL * 1.5)
         if len(self.cam_map_xyz) > 300_000:
-            keys = (self.cam_map_xyz / (self.MAP_VOXEL * 1.5)).astype(np.int64)
-            hashes = keys[:,0]*73856093 ^ keys[:,1]*19349669 ^ keys[:,2]*83492791
-            _, idx = np.unique(hashes, return_index=True)
-            self.cam_map_xyz = self.cam_map_xyz[idx]
-            self.cam_map_rgb = self.cam_map_rgb[idx]
+            idx = voxel_downsample_idx(self.cam_map_xyz, self.MAP_VOXEL * 1.5)
+            self.cam_map_xyz   = self.cam_map_xyz[idx]
+            self.cam_map_depth = self.cam_map_depth[idx]
+
+        # map_points computed AFTER downsample — shows stable post-merge count
+        parts_all = [p for p in [self.lidar_map, self.cam_map_xyz] if len(p) > 0]
+        self.map_points = (np.vstack(parts_all) if len(parts_all) > 1
+                           else (parts_all[0] if parts_all
+                                 else np.empty((0, 3), dtype=np.float32)))
 
         # Occupancy grid
         if scan:
             self._update_occupancy_from_scan(scan)
-        if self.frame_count % 10 == 0:
+        if self.frame_count % 3 == 0:
             with self._occ_lock:
                 self._occ_grid = self._get_occupancy_for_dashboard()
 
@@ -410,98 +708,191 @@ class SLAMAvoidanceRobot:
         if self.frame_count % 15 == 0:
             self._prepare_3d_dashboard_data()
 
+        # Mesh reconstruction — live camera view, launched every MESH_INTERVAL frames
+        if (self.frame_count % self.MESH_INTERVAL == 0
+                and not self._mesh_building
+                and self._live_frame_xyz is not None):
+            self._mesh_building = True
+            threading.Thread(target=self._rebuild_mesh, daemon=True).start()
+
         return scan, imu_data, cam_img
 
     # ── Occupancy grid helpers ────────────────────────────────────
     def _update_occupancy_from_scan(self, scan):
+        """
+        Vectorised log-odds ray casting — no Python loops over scan rays.
+        All rays processed simultaneously with numpy outer-product sampling.
+        ~100× faster than the old per-ray Python Bresenham loop.
+        """
+        from config import np
         rx  = float(self.T_map_base[0, 3])
         ry  = float(self.T_map_base[1, 3])
         yaw = float(math.atan2(self.T_map_base[1, 0], self.T_map_base[0, 0]))
         res = self.OCC_RES
-        ox, oy = self.OCC_ORIGIN[0], self.OCC_ORIGIN[1]
+        orig_x, orig_y = self.OCC_ORIGIN[0], self.OCC_ORIGIN[1]
         sz  = self.OCC_SIZE
-        rx_g = int((rx - ox) / res)
-        ry_g = int((ry - oy) / res)
+        rx_g = int((rx - orig_x) / res)
+        ry_g = int((ry - orig_y) / res)
         if not (0 <= rx_g < sz and 0 <= ry_g < sz): return
 
-        for angle_deg, dist_mm in scan.items():
-            if dist_mm <= 10 or dist_mm > 8000: continue
-            angle_rad = yaw - math.radians(float(angle_deg))
-            d = dist_mm / 1000.0
-            hx_g = int((rx + d*math.cos(angle_rad) - ox) / res)
-            hy_g = int((ry + d*math.sin(angle_rad) - oy) / res)
-            self._bresenham_ray(rx_g, ry_g, hx_g, hy_g, sz)
+        # Build angle/distance arrays, filter invalid readings + isolated spikes
+        # Sort by angle first so neighbour comparison is meaningful
+        sorted_items = sorted(scan.items(), key=lambda kv: float(kv[0]))
+        raw_a = [float(a) for a, d in sorted_items if 150 <= float(d) <= 12000]
+        raw_d = [float(d) for a, d in sorted_items if 150 <= float(d) <= 12000]
+        ang_list = []; dist_list = []
+        n_raw = len(raw_d)
+        for i in range(n_raw):
+            d      = raw_d[i]
+            d_prev = raw_d[(i - 1) % n_raw]
+            d_next = raw_d[(i + 1) % n_raw]
+            # Spike: differs from BOTH neighbours by > 200 mm — isolated glitch
+            if abs(d - d_prev) > 200 and abs(d - d_next) > 200:
+                continue
+            ang_list.append(raw_a[i]); dist_list.append(d)
+        if not ang_list: return
 
-    def _bresenham_ray(self, x0, y0, x1, y1, sz):
-        dx = abs(x1-x0); dy = abs(y1-y0)
-        sx = 1 if x0<x1 else -1; sy = 1 if y0<y1 else -1
-        err = dx - dy; cx, cy = x0, y0
-        lo  = self.log_odds
-        while True:
-            if 0<=cx<sz and 0<=cy<sz:
-                if cx==x1 and cy==y1:
-                    lo[cy,cx] = min(self.L_MAX, lo[cy,cx] + self.L_OCC)
-                else:
-                    lo[cy,cx] = max(self.L_MIN, lo[cy,cx] + self.L_FREE)
-            if cx==x1 and cy==y1: break
-            e2 = 2*err
-            if e2>-dy: err-=dy; cx+=sx
-            if e2< dx: err+=dx; cy+=sy
+        angles  = np.radians(np.array(ang_list,  dtype=np.float64))
+        dists_m = np.array(dist_list, dtype=np.float64) / 1000.0
+        angle_rads = yaw - angles
+
+        # Endpoint grid coordinates (n_rays,)
+        hx = np.clip(((rx + dists_m * np.cos(angle_rads) - orig_x) / res
+                      ).astype(np.int32), 0, sz - 1)
+        hy = np.clip(((ry + dists_m * np.sin(angle_rads) - orig_y) / res
+                      ).astype(np.int32), 0, sz - 1)
+
+        # Sample N_STEPS points along every ray simultaneously via outer product.
+        # N=480 → 1 sample/cell for a 12 m ray at 0.025 m/cell — full coverage.
+        N = 480
+        if self._gpu_occ:
+            import cupy as cp
+            hx_cp = cp.asarray(hx, dtype=cp.int32)
+            hy_cp = cp.asarray(hy, dtype=cp.int32)
+            t_cp  = cp.linspace(0.0, 1.0, N + 1, dtype=cp.float32)
+            gx_cp = cp.clip((rx_g + cp.outer(hx_cp - rx_g, t_cp)).astype(cp.int32), 0, sz - 1)
+            gy_cp = cp.clip((ry_g + cp.outer(hy_cp - ry_g, t_cp)).astype(cp.int32), 0, sz - 1)
+            lo = self.log_odds   # CuPy array — stays on GPU
+            cp.add.at(lo, (gy_cp[:, :-1].ravel(), gx_cp[:, :-1].ravel()), self.L_FREE)
+            cp.add.at(lo, (gy_cp[:, -1],           gx_cp[:, -1]),          self.L_OCC)
+            cp.clip(lo, self.L_MIN, self.L_MAX, out=lo)
+        else:
+            t  = np.linspace(0.0, 1.0, N + 1)              # (N+1,)
+            gx = np.clip((rx_g + np.outer(hx - rx_g, t)).astype(np.int32), 0, sz - 1)
+            gy = np.clip((ry_g + np.outer(hy - ry_g, t)).astype(np.int32), 0, sz - 1)
+            # gx, gy: (n_rays, N+1)
+            lo = self.log_odds
+            # Free-space: all samples except the endpoint
+            np.add.at(lo, (gy[:, :-1].ravel(), gx[:, :-1].ravel()), self.L_FREE)
+            # Occupied: endpoint only
+            np.add.at(lo, (gy[:, -1], gx[:, -1]), self.L_OCC)
+            np.clip(lo, self.L_MIN, self.L_MAX, out=lo)
 
     def _get_occupancy_for_dashboard(self):
         from config import np
-        sz   = self.OCC_SIZE
-        grid = np.full(sz*sz, -1, dtype=np.int8)
-        flat = self.log_odds.flatten()
-        grid[flat < -0.4] = 0
-        grid[flat >  0.4] = 100
-        grid[(flat >= -0.4) & (flat <= 0.4) & (flat != 0.0)] = 50
+        res = self.OCC_RES
+        sz  = self.OCC_SIZE
+        ox, oy = self.OCC_ORIGIN
+
+        # Pull log_odds to CPU once — on Jetson UMA this is a near-zero-cost remap
+        if self._gpu_occ:
+            import cupy as cp
+            lo_np = cp.asnumpy(self.log_odds)
+        else:
+            lo_np = self.log_odds
+
+        rx = float(self.T_map_base[0, 3])
+        ry = float(self.T_map_base[1, 3])
+        cx = int((rx - ox) / res)
+        cy = int((ry - oy) / res)
+
+        # ── Viewport = bounding box of the explored area ─────────────
+        # "Explored" = any cell that has ever been observed (log_odds ≠ 0).
+        # This gives a stable floor-plan view: the map doesn't scroll when
+        # the robot moves within an already-mapped room.  The box only grows
+        # when the robot reaches a genuinely new area.
+        MARGIN   = int(0.3 / res)    # 0.3 m padding — tight fit so room fills the canvas
+        MAX_HALF = int(20.0 / res)   # hard cap: never show more than ±20 m
+
+        explored = lo_np != 0.0
+        rows_any = np.any(explored, axis=1)  # (sz,) bool — which rows have data
+        cols_any = np.any(explored, axis=0)  # (sz,) bool — which cols have data
+
+        if rows_any.any():
+            rmin = int(np.argmax(rows_any))
+            rmax = int(sz - 1 - np.argmax(rows_any[::-1]))
+            cmin = int(np.argmax(cols_any))
+            cmax = int(sz - 1 - np.argmax(cols_any[::-1]))
+            y0 = max(0, rmin - MARGIN)
+            y1 = min(sz, rmax + MARGIN + 1)
+            x0 = max(0, cmin - MARGIN)
+            x1 = min(sz, cmax + MARGIN + 1)
+        else:
+            # No observations yet — tiny initial window around robot
+            INIT = int(5.0 / res)
+            x0 = max(0, cx - INIT);  x1 = min(sz, cx + INIT)
+            y0 = max(0, cy - INIT);  y1 = min(sz, cy + INIT)
+
+        # Cap to MAX_HALF around the robot so the map never becomes tiny
+        x0 = max(x0, cx - MAX_HALF);  x1 = min(x1, cx + MAX_HALF)
+        y0 = max(y0, cy - MAX_HALF);  y1 = min(y1, cy + MAX_HALF)
+
+        crop   = lo_np[y0:y1, x0:x1]
+        crop_h, crop_w = crop.shape
+
+        # Flip Y axis so display shows: left=UP, right=DOWN (world +Y → canvas UP).
+        # Row 0 of the flipped image = max world_Y; row N = min world_Y.
+        crop_display = crop[::-1, :]   # shape unchanged (crop_h, crop_w)
+        flat   = crop_display.flatten()
+
+        # Encode as uint8: 0=unknown, 85=free, 170=uncertain, 255=occupied.
+        # Base64 binary is ~2.5× smaller than JSON int array at this size.
+        import base64
+        u8 = np.zeros(len(flat), dtype=np.uint8)
+        u8[flat < -0.4] = 85             # free
+        u8[flat >  0.4] = 255            # occupied / wall
+        u8[(flat >= -0.4) & (flat <= 0.4) & (flat != 0.0)] = 170  # uncertain
+
+        # Origin of the crop in world metres.
+        # origin[0] = min world_X (left edge of image, unchanged).
+        # origin[1] = max world_Y (TOP of flipped image — largest Y value in crop).
+        crop_ox      = ox + x0 * res
+        crop_oy_max  = oy + (y1 - 1) * res   # max Y = top of flipped image
+
         return {
-            "grid":   grid.tolist(),
-            "res":    self.OCC_RES,
-            "origin": self.OCC_ORIGIN.tolist(),
-            "size":   sz,
-            "trail":  self.robot_trail[-1000:],
-            "robot":  [float(self.T_map_base[0,3]), float(self.T_map_base[1,3])],
-            "yaw":    float(math.atan2(self.T_map_base[1,0], self.T_map_base[0,0])),
+            "grid_b64": base64.b64encode(u8.tobytes()).decode('ascii'),
+            "res":    res,
+            "origin": [float(crop_ox), float(crop_oy_max)],
+            "size_w": crop_w,
+            "size_h": crop_h,
+            "trail":     self.robot_trail[-500:],
+            "robot":        [rx, ry],
+            "yaw":          float(math.atan2(self.T_map_base[1,0], self.T_map_base[0,0])),
+            "robot_length": self.robot_length,
+            "robot_width":  self.robot_width,
+            "waypoints": self._perim_waypoints,
+            "wp_idx":    self._perim_wp_idx,
         }
 
     # ── 3-D dashboard data ────────────────────────────────────────
     def _prepare_3d_dashboard_data(self):
         from config import np
-        data = {"lidar": None, "lidar_loop": None, "camera": None}
+        data = {"lidar": None, "camera": None}
 
         if len(self.lidar_map) > 0:
             ds = voxel_downsample(self.lidar_map, 0.12)
             if len(ds) > 6000: ds = ds[::len(ds)//6000]
-            WALL_BOTTOM = -0.05; WALL_TOP = 2.20; WALL_STEPS = 8
-            heights  = [WALL_BOTTOM + (WALL_TOP-WALL_BOTTOM)*k/(WALL_STEPS-1)
-                        for k in range(WALL_STEPS)]
-            extruded = []
-            for pt in ds:
-                for h in heights:
-                    extruded.append([round(float(pt[0]),3),
-                                     round(float(pt[1]),3),
-                                     round(h,3)])
-            data["lidar"] = extruded
-
-            if len(ds) > 2:
-                cx = float(ds[:,0].mean()); cy = float(ds[:,1].mean())
-                order = np.argsort(np.arctan2(ds[:,1]-cy, ds[:,0]-cx))
-                loop  = [[round(float(p[0]),3),round(float(p[1]),3),round(float(p[2]),3)]
-                         for p in ds[order]]
-                if loop: loop.append(loop[0])
-                data["lidar_loop"] = loop
+            # Send flat XY wall points only (no extrusion — dashboard handles height)
+            _lid_r = np.round(ds[:, :2].astype(np.float32), 3)
+            data["lidar"] = _lid_r.tolist()
 
         if len(self.cam_map_xyz) > 0:
-            step = max(1, len(self.cam_map_xyz) // 25000)
-            xyz  = self.cam_map_xyz[::step]
-            rgb  = self.cam_map_rgb[::step]
-            data["camera"] = [
-                [round(float(xyz[i,0]),3), round(float(xyz[i,1]),3), round(float(xyz[i,2]),3),
-                 int(rgb[i,0]), int(rgb[i,1]), int(rgb[i,2])]
-                for i in range(len(xyz))
-            ]
+            step  = max(1, len(self.cam_map_xyz) // 25000)
+            xyz   = self.cam_map_xyz[::step]
+            depth = self.cam_map_depth[::step]
+            _xyz_r = np.round(xyz.astype(np.float32), 3)
+            _dep_r = np.round(depth[:len(xyz)].astype(np.float32), 3).reshape(-1, 1)
+            data["camera"] = np.hstack([_xyz_r, _dep_r]).tolist()
 
         with self._map3d_lock:
             self._map3d_data = data
@@ -544,14 +935,231 @@ class SLAMAvoidanceRobot:
         with self._map3d_lock:  return self._map3d_data
 
     def get_live_frame(self):
-        """Returns (xyz Nx3 float32, rgb Nx3 uint8) or (None, None)."""
+        """Returns (xyz Nx3 float32, depth N float32) or (None, None)."""
         with self._live_frame_lock:
             if self._live_frame_xyz is None: return None, None
-            return self._live_frame_xyz.copy(), self._live_frame_rgb.copy()
+            return self._live_frame_xyz.copy(), self._live_frame_depth.copy()
+
+    def get_stream3d_bytes(self):
+        """Returns pre-serialised JSON bytes for /stream3d endpoint."""
+        with self._stream3d_cache_lock:
+            return self._stream3d_cache
+
+    def get_mesh(self):
+        with self._mesh_lock: return self._mesh_data
+
+    # ── Perimeter waypoint generation ─────────────────────────────
+    def _generate_perimeter_waypoints(self, scan):
+        """
+        From the initial LiDAR scan, create one waypoint per 18° angular sector,
+        placed WALL_MARGIN metres inside the nearest detected wall in that sector.
+        Waypoints are sorted by angle → the robot traces the room perimeter in order.
+        Returns a list of [wx, wy] world-frame positions.
+        """
+        rx  = float(self.T_map_base[0, 3])
+        ry  = float(self.T_map_base[1, 3])
+        yaw = float(math.atan2(self.T_map_base[1, 0], self.T_map_base[0, 0]))
+
+        BIN_DEG = 18            # degrees per sector
+        N_BINS  = int(360 / BIN_DEG)   # 20 sectors
+        bins    = {}            # bin_idx → (angle_deg, dist_mm)
+
+        for angle_deg, dist_mm in scan.items():
+            if dist_mm < 300 or dist_mm > 12000: continue
+            b = int(float(angle_deg) / BIN_DEG) % N_BINS
+            # Keep the closest wall in each angular sector
+            if b not in bins or dist_mm < bins[b][1]:
+                bins[b] = (float(angle_deg), dist_mm)
+
+        if len(bins) < 4:
+            print("[Perimeter] Too few scan points — aborting perimeter generation")
+            return []
+
+        waypoints = []
+        for b in sorted(bins.keys()):
+            angle_deg, dist_mm = bins[b]
+            d = dist_mm / 1000.0 - self.WALL_MARGIN
+            if d < 0.2: continue          # wall too close to robot
+            # Convert from sensor-frame angle to world-frame coordinates
+            ar = yaw - math.radians(angle_deg)
+            waypoints.append([rx + d * math.cos(ar),
+                               ry + d * math.sin(ar)])
+
+        print(f"[Perimeter] {len(waypoints)} waypoints — room traversal ready")
+        return waypoints
+
+    # ── Mesh reconstruction (incremental BPA camera mesh) ───────────
+    def _rebuild_mesh(self):
+        """
+        Incremental BPA mesh from live camera frame.
+        Only voxels not yet meshed are processed each pass —
+        mesh grows as the robot moves into new areas.
+        Depth colormap: blue=near, red=far (jet).
+        """
+        from config import np
+        _import_o3d()
+        from config import o3d
+
+        if not self._running:
+            self._mesh_building = False
+            return
+
+        # ── Grab live camera frame (world coords) ─────────────────────
+        with self._live_frame_lock:
+            if self._live_frame_xyz is None or len(self._live_frame_xyz) < 100:
+                self._mesh_building = False
+                return
+            xyz_live   = self._live_frame_xyz.copy()
+            depth_live = (self._live_frame_depth.copy()
+                          if self._live_frame_depth is not None else None)
+        if depth_live is None or len(depth_live) != len(xyz_live):
+            self._mesh_building = False
+            return
+
+        from lidar import voxel_downsample_idx
+
+        # ── Voxel downsample ──────────────────────────────────────────
+        BPA_MAX   = 12000
+        BPA_VOXEL = 0.015
+
+        ds_idx    = voxel_downsample_idx(xyz_live.astype(np.float32), BPA_VOXEL)
+        bpa_xyz   = xyz_live[ds_idx].astype(np.float64)
+        bpa_depth = depth_live[ds_idx]
+
+        if len(bpa_xyz) > BPA_MAX:
+            coarser = BPA_VOXEL * (len(bpa_xyz) / BPA_MAX) ** (1/3)
+            ds2     = voxel_downsample_idx(bpa_xyz.astype(np.float32), float(coarser))
+            bpa_xyz   = bpa_xyz[ds2]
+            bpa_depth = bpa_depth[ds2]
+
+        # ── Depth gate ────────────────────────────────────────────────
+        near_mask = bpa_depth <= self.MESH_MIN_DIST
+        if not near_mask.any():
+            self._mesh_building = False
+            return
+        bpa_xyz   = bpa_xyz[near_mask]
+        bpa_depth = bpa_depth[near_mask]
+
+        # ── New-voxel gate — skip already-meshed cells ────────────────
+        TRACK = self.TRACK_VOXEL
+        P1, P2 = np.int64(1_000_003), np.int64(1_000_033)
+        vk     = np.floor(bpa_xyz / TRACK).astype(np.int64)
+        packed = (vk[:, 0] * P1 + vk[:, 1] * P2 + vk[:, 2]).astype(np.int64)
+        is_new = ~np.isin(packed, self._meshed_voxels)
+        if not is_new.any():
+            self._mesh_building = False
+            return
+        new_voxel_keys = np.unique(packed[is_new])
+        bpa_xyz   = bpa_xyz[is_new]
+        bpa_depth = bpa_depth[is_new]
+
+        # ── Jet depth colormap ────────────────────────────────────────
+        d_min = float(bpa_depth.min()); d_max = float(bpa_depth.max())
+        d_rng = max(d_max - d_min, 0.1)
+        t = np.clip((bpa_depth - d_min) / d_rng, 0.0, 1.0).astype(np.float64)
+        colors = np.stack([
+            np.clip(1.5 - np.abs(4*t - 3), 0, 1),
+            np.clip(1.5 - np.abs(4*t - 2), 0, 1),
+            np.clip(1.5 - np.abs(4*t - 1), 0, 1),
+        ], axis=1)
+
+        # ── Build point cloud + two-pass outlier removal ──────────────
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(bpa_xyz)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        if len(bpa_xyz) >= 30:
+            pcd, inlier_idx = pcd.remove_statistical_outlier(
+                nb_neighbors=25, std_ratio=2.5)
+            bpa_xyz   = bpa_xyz[inlier_idx]
+            bpa_depth = bpa_depth[inlier_idx]
+            if len(bpa_xyz) >= 30:
+                pcd, inlier_idx2 = pcd.remove_radius_outlier(
+                    nb_points=4, radius=0.09)
+                bpa_xyz   = bpa_xyz[inlier_idx2]
+                bpa_depth = bpa_depth[inlier_idx2]
+
+        if len(np.asarray(pcd.points)) < 50:
+            self._mesh_building = False
+            return
+
+        # ── Normal estimation ─────────────────────────────────────────
+        nn_dists    = np.asarray(pcd.compute_nearest_neighbor_distance())
+        mean_d      = float(np.median(nn_dists)) if len(nn_dists) > 0 else 0.05
+        mean_d      = float(np.clip(mean_d, 0.012, 0.10))
+        norm_radius = float(np.clip(mean_d * 8.0, 0.08, 0.40))
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=norm_radius, max_nn=75))
+        T_map_cam = (self.T_map_base @ self.T_base_cam).astype(np.float64)
+        pcd.orient_normals_towards_camera_location(T_map_cam[:3, 3])
+
+        # ── BPA reconstruction ────────────────────────────────────────
+        bpa_radii = [
+            mean_d * 1.2,
+            mean_d * 2.0,
+            mean_d * 3.5,
+            min(mean_d * 6.5, 0.12),
+        ]
+        try:
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                pcd, o3d.utility.DoubleVector(bpa_radii))
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_non_manifold_edges()
+            mesh.remove_unreferenced_vertices()
+            if len(np.asarray(mesh.vertices)) > 10:
+                mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
+            mesh.compute_vertex_normals()
+        except Exception as e:
+            print(f"[Mesh] BPA failed: {e}")
+            self._mesh_building = False
+            return
+
+        new_verts = np.asarray(mesh.vertices,      dtype=np.float32)
+        new_faces = np.asarray(mesh.triangles,     dtype=np.int32)
+        new_vcols = np.asarray(mesh.vertex_colors, dtype=np.float32)
+        if len(new_verts) == 0 or len(new_faces) == 0:
+            self._mesh_building = False
+            return
+        if len(new_vcols) == 0:
+            new_vcols = np.tile([0.15, 0.75, 0.90], (len(new_verts), 1)).astype(np.float32)
+
+        # ── Merge into accumulated mesh ───────────────────────────────
+        MAX_ACC_VERTS = 200_000
+        face_off = len(self._acc_mesh_verts)
+        self._acc_mesh_verts  = np.vstack([self._acc_mesh_verts,  new_verts])
+        self._acc_mesh_faces  = np.vstack([self._acc_mesh_faces,  new_faces + face_off])
+        self._acc_mesh_colors = np.vstack([self._acc_mesh_colors, new_vcols])
+
+        if len(self._acc_mesh_verts) > MAX_ACC_VERTS:
+            keep    = MAX_ACC_VERTS
+            v_start = len(self._acc_mesh_verts) - keep
+            valid   = (self._acc_mesh_faces >= v_start).all(axis=1)
+            self._acc_mesh_faces  = self._acc_mesh_faces[valid] - v_start
+            self._acc_mesh_verts  = self._acc_mesh_verts[-keep:]
+            self._acc_mesh_colors = self._acc_mesh_colors[-keep:]
+
+        self._meshed_voxels = np.union1d(self._meshed_voxels, new_voxel_keys)
+
+        acc_v = self._acc_mesh_verts
+        acc_f = self._acc_mesh_faces
+        acc_c = self._acc_mesh_colors
+        with self._mesh_lock:
+            self._mesh_data = {"cam": {
+                "verts":  acc_v.round(3).tolist(),
+                "faces":  acc_f.tolist(),
+                "colors": (np.clip(acc_c, 0, 1) * 255).astype(np.uint8).tolist(),
+            }}
+        self._mesh_building = False
+        print(f"[Mesh] +{len(new_faces)} tris | total {len(self._acc_mesh_faces)} tris"
+              f" | depth {d_min:.1f}–{d_max:.1f} m")
 
     # ── Main loop ─────────────────────────────────────────────────
     def run(self):
         self._running = True
+        if self.camera:
+            threading.Thread(target=self._camera_loop, daemon=True).start()
         mode = 'Map-only mode' if self.map_only else 'Avoidance + Mapping'
         print(f"\n[SLAM] {mode} started! Ctrl+C to stop.\n")
 
@@ -562,7 +1170,7 @@ class SLAMAvoidanceRobot:
                     self.state = "WAIT_LIDAR"
                     self._stop(); time.sleep(0.1); continue
 
-                hist   = self.lidar.get_histogram(self.VFH_BIN, 6000)
+                hist   = self.lidar.get_histogram(self.VFH_BIN, 12000)
                 zones  = self.lidar.get_zone_distances(scan)
                 f  = zones["FRONT"]; fl = zones["FRONT_LEFT"]; fr = zones["FRONT_RIGHT"]
                 fmin = min(f, fl, fr)
@@ -574,6 +1182,79 @@ class SLAMAvoidanceRobot:
                     self.state_detail = f"pts={len(self.map_points)} f={self.frame_count}"
                     time.sleep(self.LOOP_RATE)
                     self._print_status(zones, target, gap)
+                    continue
+
+                # ── Phase 1: initial still scan ───────────────────────────
+                if not self._perim_done and self.frame_count < self.INIT_SCAN_FRAMES:
+                    self.state        = "INIT_SCAN"
+                    self.state_detail = f"{self.frame_count}/{self.INIT_SCAN_FRAMES} building map…"
+                    self._brake()
+                    time.sleep(self.LOOP_RATE)
+                    self._print_status(zones, target, gap)
+                    continue
+
+                # ── Phase 2: generate waypoints once ─────────────────────
+                if not self._perim_done and not self._perim_waypoints:
+                    self._perim_waypoints = self._generate_perimeter_waypoints(scan)
+                    self._perim_wp_t0     = time.time()
+                    if not self._perim_waypoints:
+                        self._perim_done = True   # nothing to traverse; fall through
+
+                # ── Phase 3: perimeter traversal ─────────────────────────
+                if not self._perim_done and self._perim_waypoints:
+                    wp  = self._perim_waypoints[self._perim_wp_idx]
+                    rx_ = float(self.T_map_base[0, 3])
+                    ry_ = float(self.T_map_base[1, 3])
+                    dx, dy      = wp[0] - rx_, wp[1] - ry_
+                    dist_to_wp  = math.sqrt(dx * dx + dy * dy)
+
+                    self.state        = "PERIMETER"
+                    self.state_detail = (
+                        f"wp {self._perim_wp_idx+1}/{len(self._perim_waypoints)}"
+                        f" d={dist_to_wp:.1f}m"
+                    )
+
+                    # Waypoint reached or timed-out → advance
+                    if (dist_to_wp < self.WP_REACH_DIST
+                            or time.time() - self._perim_wp_t0 > self.WP_TIMEOUT):
+                        self._perim_wp_idx += 1
+                        self._perim_wp_t0   = time.time()
+                        if self._perim_wp_idx >= len(self._perim_waypoints):
+                            print(f"\n[Perimeter] Complete — switching to normal navigation")
+                            self._perim_done = True
+                        time.sleep(self.LOOP_RATE)
+                        self._print_status(zones, target, gap)
+                        continue
+
+                    # Compute robot-relative heading to waypoint
+                    robot_yaw    = math.atan2(self.T_map_base[1, 0], self.T_map_base[0, 0])
+                    wp_angle     = math.atan2(dy, dx)
+                    delta        = (wp_angle - robot_yaw + math.pi) % (2 * math.pi) - math.pi
+                    wp_target    = (-math.degrees(delta)) % 360  # CW robot-frame degrees
+
+                    if self._check_stuck(fmin):
+                        self._unstuck()
+                    elif fmin < self.EMERGENCY_DIST:
+                        self.state = "PERIM_EMRG"
+                        self._drive(-self.REVERSE_SPEED, -self.REVERSE_SPEED)
+                        time.sleep(self.REVERSE_TIME)
+                        side = self.TURN_SPEED
+                        if fl < fr: self._drive( side, -side)
+                        else:       self._drive(-side,  side)
+                        time.sleep(self.TURN_TIME)
+                        self._front_history.clear()
+                    elif fmin < self.STOP_DIST:
+                        # Blocked — spin toward VFH gap heading
+                        self.state = "PERIM_TURN"
+                        herr = ((target or 0) + 180) % 360 - 180
+                        d    = 1 if herr >= 0 else -1
+                        self._drive(d * self.TURN_SPEED, -d * self.TURN_SPEED)
+                    else:
+                        speed = self._scale_speed(fmin)
+                        self._steer(wp_target, speed)
+
+                    self._print_status(zones, target, gap)
+                    time.sleep(self.LOOP_RATE)
                     continue
 
                 if self._check_stuck(fmin):
@@ -624,6 +1305,7 @@ class SLAMAvoidanceRobot:
         finally:
             self._brake()
             self._save_map()
+            self.close()
 
     def _print_status(self, zones, target, gap):
         f = zones["FRONT"]; fl = zones["FRONT_LEFT"]; fr = zones["FRONT_RIGHT"]
@@ -632,7 +1314,7 @@ class SLAMAvoidanceRobot:
         mp  = len(self.map_points)
         sys.stdout.write(
             f"\r[{self.state:<12}] {self.state_detail:<24} "
-            f"F:{f:5d} FL:{fl:5d} FR:{fr:5d} "
+            f"F:{int(f):5d} FL:{int(fl):5d} FR:{int(fr):5d} "
             f"Tgt:{tgt:>5} Gap:{gw:>5} "
             f"L:{self.current_l:+4d} R:{self.current_r:+4d} "
             f"Map:{mp:6d} Frm:{self.frame_count}  "
@@ -645,9 +1327,11 @@ class SLAMAvoidanceRobot:
         ox, oy = self.OCC_ORIGIN
         pgm_path  = os.path.expanduser("~/slam_map.pgm")
         yaml_path = os.path.expanduser("~/slam_map.yaml")
+        _lo = (self.log_odds if not self._gpu_occ
+               else __import__('cupy').asnumpy(self.log_odds))
         pgm = np.full((sz, sz), 205, dtype=np.uint8)
-        pgm[self.log_odds < -0.4] = 254
-        pgm[self.log_odds >  0.4] = 0
+        pgm[_lo < -0.4] = 254
+        pgm[_lo >  0.4] = 0
         with open(pgm_path, 'wb') as f:
             f.write(f"P5\n{sz} {sz}\n255\n".encode())
             f.write(np.flipud(pgm).tobytes())
@@ -663,14 +1347,27 @@ class SLAMAvoidanceRobot:
             pcd_path = os.path.expanduser("~/slam_map.pcd")
             save_pcd(pcd_path, all_pts)
             print(f"[SLAM] 3D cloud  → {pcd_path} ({len(all_pts)} pts)")
-        if len(self.lidar_map)   > 0: np.save(os.path.expanduser("~/slam_lidar.npy"),      self.lidar_map)
+        if len(self.lidar_map)   > 0: np.save(os.path.expanduser("~/slam_lidar.npy"),        self.lidar_map)
         if len(self.cam_map_xyz) > 0:
-            np.save(os.path.expanduser("~/slam_camera.npy"),     self.cam_map_xyz)
-            np.save(os.path.expanduser("~/slam_camera_rgb.npy"), self.cam_map_rgb)
+            np.save(os.path.expanduser("~/slam_camera.npy"),       self.cam_map_xyz)
+            np.save(os.path.expanduser("~/slam_camera_depth.npy"), self.cam_map_depth)
 
     def close(self):
         self._running = False
         self._brake()
+
+        # Wait for background mesh thread to finish before tearing down
+        # Open3D objects — otherwise TSDF/BPA C++ destructor segfaults
+        deadline = time.time() + 5.0
+        while self._mesh_building and time.time() < deadline:
+            time.sleep(0.05)
+
+        # Safely destroy TSDF volume under lock so no thread can access it
+        # after free
+        if self._tsdf is not None:
+            with self._tsdf_lock:
+                self._tsdf = None
+
         if self.motors: self.motors.close()
         self.lidar.close()
         if self.imu:

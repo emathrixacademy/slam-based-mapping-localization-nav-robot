@@ -7,12 +7,16 @@ import json
 import math
 
 # ── Lazy-import globals ───────────────────────────────────────────
-np       = None
-Rotation = None
-cKDTree  = None
-rs       = None
-SMBus    = None
-cv2      = None
+np          = None
+Rotation    = None
+cKDTree     = None
+rs          = None
+SMBus       = None
+cv2         = None
+o3d         = None
+cp          = None   # cupy — None when CUDA unavailable
+cuda_ok     = False  # True once CuPy + CUDA confirmed working
+o3d_cuda_ok = False  # True when Open3D is compiled with CUDA support
 
 def _import_numpy():
     global np
@@ -46,6 +50,36 @@ def _import_cv2():
         import cv2 as _cv2
         cv2 = _cv2
 
+def _import_cupy():
+    """Try to initialise CuPy + CUDA. Sets cuda_ok=True on success."""
+    global cp, cuda_ok
+    if cuda_ok:
+        return
+    try:
+        import cupy as _cp
+        _cp.cuda.Device(0).use()
+        _cp.array([1.0], dtype=_cp.float32)   # warm-up — fails fast if no GPU
+        cp       = _cp
+        cuda_ok  = True
+        print("[CUDA] CuPy GPU acceleration ready")
+    except Exception as e:
+        cp      = None
+        cuda_ok = False
+        print(f"[CUDA] CuPy not available ({e}) — CPU only")
+
+
+def _import_o3d():
+    global o3d, o3d_cuda_ok
+    if o3d is None:
+        import open3d as _o3d
+        o3d = _o3d
+        try:
+            o3d_cuda_ok = bool(o3d.core.cuda.is_available())
+            if o3d_cuda_ok:
+                print("[CUDA] Open3D CUDA tensor backend available")
+        except Exception:
+            o3d_cuda_ok = False
+
 
 # ── Default robot configuration ───────────────────────────────────
 DEFAULT_CONFIG = {
@@ -71,10 +105,18 @@ DEFAULT_CONFIG = {
     "CAMERA_Y": 0.00,
     "CAMERA_Z": 0.15,
 
-    # LiDAR body position
-    "LIDAR_X": 0.00,
+    # Robot physical dimensions (metres)
+    "ROBOT_LENGTH": 0.370,   # front-to-back
+    "ROBOT_WIDTH":  0.305,   # side-to-side
+
+    # LiDAR body position (front centre of robot, 230 mm off floor)
+    "LIDAR_X": 0.185,   # half of robot length — mounted at front
     "LIDAR_Y": 0.00,
-    "LIDAR_Z": 0.20,
+    "LIDAR_Z": 0.23,
+
+    # IMU gyro Z-axis sign.  +1.0 if yaw increases CCW (standard flat mount).
+    # Set to -1.0 if the heading prediction makes drift WORSE (IMU mounted inverted).
+    "IMU_GYRO_SIGN": 1.0,
 }
 
 

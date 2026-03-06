@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SLAM Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap');
+:root{
+  --bg:#060810;--card:#0d1117;--card2:#111820;--border:#1b2332;--text:#b8c4d4;
+  --dim:#3e4a5c;--blue:#3b82f6;--green:#10b981;--red:#ef4444;
+  --orange:#f59e0b;--cyan:#06b6d4;--purple:#a78bfa;--white:#e8ecf2
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}
+
+/* ── Top bar ── */
+.top{
+  padding:8px 14px;display:flex;align-items:center;justify-content:space-between;
+  background:rgba(13,17,23,.92);border-bottom:1px solid var(--border);
+  backdrop-filter:blur(10px);position:sticky;top:0;z-index:50
+}
+.top h1{font-size:.88rem;font-weight:700;color:#fff;display:flex;align-items:center;gap:6px}
+.pills{display:flex;gap:5px}
+.pill{
+  padding:2px 8px;border-radius:10px;font-size:.58rem;
+  font-family:'JetBrains Mono',monospace;font-weight:600;border:1px solid var(--border)
+}
+.pill.on{border-color:var(--green);color:var(--green)}
+.pill.off{border-color:#333;color:#444}
+
+/* ── Layouts ── */
+.main{display:grid;grid-template-columns:1fr 1.3fr 1fr;gap:6px;padding:6px}
+.bottom{display:grid;grid-template-columns:2fr 1fr;gap:6px;padding:0 6px 6px}
+@media(max-width:1000px){.main{grid-template-columns:1fr 1fr}.bottom{grid-template-columns:1fr}}
+@media(max-width:600px){.main{grid-template-columns:1fr}.bottom{grid-template-columns:1fr}}
+
+/* ── Cards ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.ch{
+  padding:6px 10px;font-size:.65rem;font-weight:600;color:var(--blue);
+  text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:5px
+}
+.ch .dot{width:5px;height:5px;border-radius:50%;background:var(--green)}
+.cb{padding:6px;display:flex;flex-direction:column;align-items:center}
+
+/* ── Camera feed ── */
+#cam_img{width:100%;display:block;border-radius:4px;background:#000;min-height:160px;object-fit:contain}
+#cam_ph{
+  min-height:160px;display:flex;align-items:center;justify-content:center;
+  color:var(--dim);font-size:.7rem;font-family:'JetBrains Mono',monospace;width:100%
+}
+
+/* ── Three.js container ── */
+#three_box{
+  width:100%;height:320px;position:relative;
+  background:#06080c;border-radius:4px;cursor:grab
+}
+#three_box:active{cursor:grabbing}
+#three_box canvas{border-radius:4px}
+
+/* stream status badge */
+.sbadge{
+  position:absolute;top:8px;left:8px;font-size:.52rem;
+  font-family:'JetBrains Mono',monospace;font-weight:600;
+  padding:2px 8px;border-radius:6px;z-index:3;letter-spacing:.3px
+}
+.sbadge.live{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:var(--green)}
+.sbadge.stale{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);color:var(--orange)}
+.sbadge.dead{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);color:var(--red)}
+
+.thr_info{
+  position:absolute;bottom:8px;left:8px;font-size:.55rem;color:rgba(255,255,255,.3);
+  font-family:'JetBrains Mono',monospace;pointer-events:none;z-index:2
+}
+
+/* depth colorbar legend */
+.depth_bar{
+  position:absolute;top:8px;right:8px;z-index:2;display:flex;flex-direction:column;
+  align-items:flex-end;gap:2px
+}
+.depth_bar canvas{width:12px;height:80px;border-radius:3px;border:1px solid rgba(255,255,255,.1)}
+.depth_bar .dl{font-size:.48rem;color:var(--dim);font-family:'JetBrains Mono',monospace}
+.depth_bar .dt{font-size:.48rem;color:var(--dim);font-family:'JetBrains Mono',monospace}
+.legend_row{display:flex;align-items:center;gap:4px;font-size:.52rem;color:var(--dim);font-family:'JetBrains Mono',monospace}
+.legend_sq{width:7px;height:7px;border-radius:1px}
+
+/* ── 2-D map ── */
+#map_wrap{position:relative;width:100%;background:#06080c;border-radius:4px;overflow:hidden}
+#map_canvas{width:100%;aspect-ratio:1;display:block;image-rendering:pixelated}
+.map_legend{
+  position:absolute;bottom:6px;left:8px;display:flex;gap:8px;font-size:.55rem;
+  font-family:'JetBrains Mono',monospace;color:var(--dim);z-index:2
+}
+.map_legend div{display:flex;align-items:center;gap:3px}
+.map_legend .sq{width:8px;height:8px;border-radius:1px}
+
+/* ── Radar ── */
+canvas.radar{display:block;margin:0 auto;max-width:100%;border-radius:50%}
+
+
+/* ── Status grid ── */
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:3px;width:100%}
+.si{padding:5px 7px;background:var(--card2);border-radius:5px;border:1px solid var(--border)}
+.si .sl{font-size:.52rem;color:var(--dim);font-family:'JetBrains Mono',monospace;text-transform:uppercase}
+.si .sv{font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;margin-top:1px}
+
+/* ── Zone rows ── */
+.zr{
+  display:flex;justify-content:space-between;padding:2px 5px;font-size:.6rem;
+  font-family:'JetBrains Mono',monospace;border-bottom:1px solid rgba(255,255,255,.02)
+}
+.zr.zd{color:var(--red);font-weight:700}
+.zr.zw{color:var(--orange)}
+
+/* ── Badges ── */
+.badge{
+  display:inline-block;padding:2px 8px;border-radius:10px;
+  font-size:.62rem;font-weight:600;font-family:'JetBrains Mono',monospace
+}
+.badge.ok    {background:rgba(16,185,129,.08);color:var(--green);border:1px solid rgba(16,185,129,.15)}
+.badge.warn  {background:rgba(245,158,11,.08);color:var(--orange);border:1px solid rgba(245,158,11,.15)}
+.badge.danger{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+
+/* ── View-mode toggle ── */
+.view_toggle{
+  display:flex;gap:3px;margin-left:auto
+}
+.vtbtn{
+  padding:2px 7px;border-radius:5px;font-size:.52rem;font-family:'JetBrains Mono',monospace;
+  font-weight:600;cursor:pointer;border:1px solid var(--border);color:var(--dim);
+  background:transparent;letter-spacing:.3px;transition:all .15s
+}
+.vtbtn.active{border-color:var(--cyan);color:var(--cyan);background:rgba(6,182,212,.07)}
+.mesh_badge{
+  position:absolute;top:8px;left:50%;transform:translateX(-50%);
+  font-size:.52rem;font-family:'JetBrains Mono',monospace;font-weight:600;
+  padding:2px 10px;border-radius:6px;z-index:3;pointer-events:none;
+  background:rgba(167,139,250,.12);border:1px solid rgba(167,139,250,.3);color:var(--purple)
+}
+
+/* ── E-stop button ── */
+#estop{
+  position:fixed;bottom:12px;left:12px;width:44px;height:44px;border-radius:50%;
+  background:var(--red);border:2px solid #f87171;display:flex;align-items:center;
+  justify-content:center;font-size:1rem;cursor:pointer;z-index:100;
+  box-shadow:0 4px 20px rgba(239,68,68,.3)
+}
+</style>
+</head>
+<body>
+
+<!-- ── Top bar ── -->
+<div class="top">
+  <h1><span>🗺</span> SLAM Mapping</h1>
+  <div class="pills">
+    <div class="pill" id="p_cam">CAM</div>
+    <div class="pill" id="p_lid">LIDAR</div>
+    <div class="pill" id="p_imu">IMU</div>
+  </div>
+</div>
+
+<!-- ── Main row ── -->
+<div class="main">
+
+  <!-- Camera feed -->
+  <div class="card">
+    <div class="ch"><div class="dot" id="cd"></div>RealSense Camera</div>
+    <div class="cb">
+      <img id="cam_img" style="display:none">
+      <div id="cam_ph">Waiting for camera…</div>
+    </div>
+  </div>
+
+  <!-- 3-D viewer -->
+  <div class="card">
+    <div class="ch">
+      <div class="dot" id="stream_dot"></div>
+      3D Map
+      <span style="color:var(--dim);font-weight:400;font-size:.6rem;margin-left:2px">LiDAR + RealSense</span>
+      <div class="view_toggle">
+        <button class="vtbtn active" id="btn_pts"  onclick="setView('pts')">POINTS</button>
+        <button class="vtbtn"        id="btn_mesh" onclick="setView('mesh')">MESH</button>
+        <button class="vtbtn"        id="btn_both" onclick="setView('both')">BOTH</button>
+      </div>
+    </div>
+    <div class="cb" style="padding:0;position:relative">
+      <div id="three_box">
+        <div class="sbadge dead" id="sbadge">○ NO SIGNAL</div>
+        <div class="mesh_badge" id="mesh_badge" style="display:none">⬡ MESH READY</div>
+        <!-- Depth rainbow colorbar -->
+        <div class="depth_bar">
+          <div class="dl" id="depth_max">3.0m</div>
+          <canvas id="colorbar" width="12" height="80"></canvas>
+          <div class="dt">0.0m</div>
+          <div style="margin-top:4px">
+            <div class="legend_row"><div class="legend_sq" style="background:#06c8d4"></div>LiDAR</div>
+          </div>
+        </div>
+        <div class="thr_info" id="pc_info">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Radar -->
+  <div class="card">
+    <div class="ch"><div class="dot"></div>LiDAR Radar</div>
+    <div class="cb">
+      <canvas class="radar" id="radar" width="260" height="260"></canvas>
+      <div style="margin-top:5px;text-align:center">
+        <span class="badge ok" id="sbadge2">IDLE</span>
+        <span style="font-size:.6rem;color:var(--dim);margin-left:5px;font-family:'JetBrains Mono',monospace"
+              id="sdetail"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Bottom row ── -->
+<div class="bottom">
+
+  <!-- 2-D SLAM map -->
+  <div class="card">
+    <div class="ch">
+      <div class="dot"></div>2D SLAM Map
+      <span style="color:var(--dim);font-weight:400;font-size:.6rem;margin-left:4px">occupancy grid · log-odds</span>
+    </div>
+    <div class="cb" style="padding:4px">
+      <div id="map_wrap">
+        <canvas id="map_canvas" width="720" height="720"></canvas>
+        <div class="map_legend">
+          <div><div class="sq" style="background:#dce2ea"></div>Free</div>
+          <div><div class="sq" style="background:#fff"></div>Wall</div>
+          <div><div class="sq" style="background:#1e2430"></div>Unknown</div>
+          <div><div class="sq" style="background:#10b981"></div>Trail</div>
+          <div><div class="sq" style="background:#ef4444"></div>Robot</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status + Zones -->
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <div class="card" style="flex:1">
+      <div class="ch"><div class="dot"></div>Status</div>
+      <div class="cb" style="align-items:stretch">
+        <div class="sg">
+          <div class="si"><div class="sl">Left RPM</div><div class="sv" style="color:var(--cyan)" id="ml">0</div></div>
+          <div class="si"><div class="sl">Right RPM</div><div class="sv" style="color:var(--cyan)" id="mr">0</div></div>
+          <div class="si"><div class="sl">LiDAR pts</div><div class="sv" style="color:var(--white)" id="lpts">0</div></div>
+          <div class="si"><div class="sl">Camera pts</div><div class="sv" style="color:var(--blue)" id="cpts">0</div></div>
+          <div class="si"><div class="sl">Position</div><div class="sv" style="color:var(--purple)" id="pos">0,0</div></div>
+          <div class="si"><div class="sl">IMU R/P/Y</div><div class="sv" id="imu">—</div></div>
+          <div class="si"><div class="sl">Target</div><div class="sv" style="color:var(--orange)" id="tgt">—</div></div>
+          <div class="si"><div class="sl">Frame</div><div class="sv" id="frm">0</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="flex:1">
+      <div class="ch"><div class="dot"></div>Zones</div>
+      <div class="cb" style="align-items:stretch" id="zones"></div>
+    </div>
+  </div>
+</div>
+
+<!-- E-stop -->
+<div id="estop"
+     onclick="fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({action:'stop'})})">⏹</div>
+
+<script>
+// ════════════════════════════════════════════════════════════════
+//  Coordinate convention
+//  Robot base frame: X=forward  Y=left  Z=up
+//  Three.js world (Y-up): b2w(bx,by,bz) → [bx, bz, -by]
+// ════════════════════════════════════════════════════════════════
+function b2w(bx,by,bz){ return [bx, bz, -by]; }
+
+// ── Jet (rainbow) colormap  ──────────────────────────────────────
+// t ∈ [0,1]  → {r,g,b} ∈ [0,1]
+function jet(t){
+  t = Math.max(0, Math.min(1, t));
+  const r = Math.max(0, Math.min(1, 1.5 - Math.abs(4*t - 3)));
+  const g = Math.max(0, Math.min(1, 1.5 - Math.abs(4*t - 2)));
+  const b = Math.max(0, Math.min(1, 1.5 - Math.abs(4*t - 1)));
+  return [r, g, b];
+}
+
+// Draw colorbar (bottom = near = blue, top = far = red)
+function drawColorbar(maxDepth){
+  const cv = document.getElementById('colorbar');
+  const ctx = cv.getContext('2d');
+  const h = cv.height, w = cv.width;
+  for(let y=0; y<h; y++){
+    const t = 1.0 - y/h;          // top = far (t=1 = red)
+    const [r,g,b] = jet(t);
+    ctx.fillStyle = `rgb(${(r*255)|0},${(g*255)|0},${(b*255)|0})`;
+    ctx.fillRect(0, y, w, 1);
+  }
+  document.getElementById('depth_max').textContent = maxDepth.toFixed(1)+'m';
+}
+
+// ── Three.js setup ───────────────────────────────────────────────
+let scene, cam3, ren;
+let dragging=false, prev={x:0,y:0}, theta=0.6, phi=0.45, dist=6;
+let lastLiveTs=0;
+
+let camLiveMesh=null, camAccumMesh=null;
+let lidarWallMesh=null, lidarOutlineMesh=null, lidarLivePts=null;
+let robotMarker=null;
+// Robot body + mesh-zone arc — updated every frame to match world pose
+let robotBodyGroup=null, meshZoneGroup=null;
+
+// Mesh objects (camera only)
+let camMeshObj=null, camWireObj=null;
+
+// View mode: 'pts' | 'mesh' | 'both'
+let viewMode = 'pts';
+
+// Latest raw scan data {angle_deg: dist_mm} — updated by pollData, used by drawMap/drawRadar
+let lastScan = {};
+
+const MAX_DEPTH = 3.0;   // RealSense max depth (metres)
+drawColorbar(MAX_DEPTH);
+
+function init3D(){
+  const el=document.getElementById('three_box');
+  const w=el.clientWidth, h=el.clientHeight||320;
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0x06080c);
+  scene.fog=new THREE.FogExp2(0x06080c, 0.038);
+  cam3=new THREE.PerspectiveCamera(50,w/h,0.05,120);
+  orbitCam();
+  ren=new THREE.WebGLRenderer({antialias:true});
+  ren.setSize(w,h);
+  ren.setPixelRatio(Math.min(window.devicePixelRatio,1.5));
+  el.appendChild(ren.domElement);
+
+  // Ground grid — fine, dark
+  scene.add(new THREE.GridHelper(30,120,0x0c1520,0x091018));
+  // Ground plane for wall footprint
+  const gp = new THREE.Mesh(
+    new THREE.PlaneGeometry(30,30),
+    new THREE.MeshBasicMaterial({color:0x06090f, side:THREE.DoubleSide})
+  );
+  gp.rotation.x=-Math.PI/2; gp.position.y=-0.01;
+  scene.add(gp);
+  scene.add(new THREE.AxesHelper(0.5));
+
+  // Robot body group — position+yaw updated every stream3d tick
+  robotBodyGroup = new THREE.Group();
+  const _rb = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.18, 0.19, 0.12, 32),
+    new THREE.MeshLambertMaterial({color:0x111820})
+  );
+  _rb.position.y = 0.06;
+  robotBodyGroup.add(_rb);
+  const _lr = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.06, 0.06, 0.05, 24),
+    new THREE.MeshLambertMaterial({color:0x223344})
+  );
+  _lr.position.y = 0.23;
+  robotBodyGroup.add(_lr);
+  scene.add(robotBodyGroup);
+
+  // Mesh-zone arc — camera FOV cone at MESH_MIN_DIST, follows robot pose
+  // Matches robot.py MESH_MIN_DIST=2.0m, RealSense D435 HFOV≈87°
+  const MESH_MIN_DIST = 2.0;
+  const CAM_HFOV_RAD  = (87 / 2) * Math.PI / 180;
+  meshZoneGroup = new THREE.Group();
+  (function(){
+    const N = 48, H = 0.24;
+    const arcPts = [];
+    for(let i = 0; i <= N; i++){
+      const a = -CAM_HFOV_RAD + (i / N) * 2 * CAM_HFOV_RAD;
+      arcPts.push(Math.cos(a)*MESH_MIN_DIST, H, -Math.sin(a)*MESH_MIN_DIST);
+    }
+    const allPts = new Float32Array([
+      0,H,0, arcPts[0],arcPts[1],arcPts[2],
+      ...arcPts,
+      arcPts[arcPts.length-3],arcPts[arcPts.length-2],arcPts[arcPts.length-1],
+      0,H,0
+    ]);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(allPts, 3));
+    meshZoneGroup.add(new THREE.Line(geo, new THREE.LineBasicMaterial({
+      color:0xffaa00, transparent:true, opacity:0.85
+    })));
+    // Filled cone
+    const shape = new THREE.Shape();
+    shape.moveTo(0,0);
+    for(let i=0;i<=N;i++){
+      const a=-CAM_HFOV_RAD+(i/N)*2*CAM_HFOV_RAD;
+      shape.lineTo(Math.cos(a)*MESH_MIN_DIST, -Math.sin(a)*MESH_MIN_DIST);
+    }
+    shape.closePath();
+    const sg = new THREE.ShapeGeometry(shape);
+    sg.rotateX(-Math.PI/2); sg.translate(0,0.01,0);
+    meshZoneGroup.add(new THREE.Mesh(sg, new THREE.MeshBasicMaterial({
+      color:0xffaa00, transparent:true, opacity:0.07, side:THREE.DoubleSide
+    })));
+  })();
+  scene.add(meshZoneGroup);
+
+  scene.add(new THREE.AmbientLight(0x334455, 1.2));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+  sun.position.set(5, 10, 5);
+  scene.add(sun);
+  const fill = new THREE.DirectionalLight(0x223366, 0.4);
+  fill.position.set(-5, 3, -5);
+  scene.add(fill);
+
+  // Mouse/touch orbit
+  ren.domElement.addEventListener('mousedown',e=>{dragging=true;prev={x:e.clientX,y:e.clientY}});
+  window.addEventListener('mouseup',()=>dragging=false);
+  window.addEventListener('mousemove',e=>{
+    if(!dragging)return;
+    theta+=(e.clientX-prev.x)*0.006;
+    phi=Math.max(0.04,Math.min(Math.PI*0.92,phi+(e.clientY-prev.y)*0.006));
+    prev={x:e.clientX,y:e.clientY};orbitCam();
+  });
+  ren.domElement.addEventListener('wheel',e=>{
+    dist=Math.max(1,Math.min(30,dist+e.deltaY*0.01));orbitCam();e.preventDefault();
+  },{passive:false});
+  let ts=null;
+  ren.domElement.addEventListener('touchstart',e=>{if(e.touches.length===1)ts={x:e.touches[0].clientX,y:e.touches[0].clientY}});
+  ren.domElement.addEventListener('touchmove',e=>{
+    if(!ts||e.touches.length!==1)return;
+    const t=e.touches[0];
+    theta+=(t.clientX-ts.x)*0.006;
+    phi=Math.max(0.04,Math.min(Math.PI*0.92,phi+(t.clientY-ts.y)*0.006));
+    ts={x:t.clientX,y:t.clientY};orbitCam();e.preventDefault();
+  },{passive:false});
+  ren.domElement.addEventListener('touchend',()=>ts=null);
+  (function loop(){requestAnimationFrame(loop);ren.render(scene,cam3);})();
+}
+
+function orbitCam(){
+  cam3.position.set(
+    dist*Math.sin(phi)*Math.cos(theta),
+    dist*Math.cos(phi),
+    dist*Math.sin(phi)*Math.sin(theta)
+  );
+  cam3.lookAt(0,0.5,0);
+}
+
+function disposeMesh(m){
+  if(!m)return;
+  scene.remove(m);
+  if(m.geometry)m.geometry.dispose();
+  if(m.material){
+    if(Array.isArray(m.material)) m.material.forEach(x=>x.dispose());
+    else m.material.dispose();
+  }
+  if(m.children) m.children.forEach(c=>disposeMesh(c));
+}
+
+// Build a PointsMaterial mesh with per-point depth → jet color
+function makeDepthPoints(ptsArr, ptSize){
+  const n = ptsArr.length;
+  const pos = new Float32Array(n*3);
+  const col = new Float32Array(n*3);
+  for(let i=0;i<n;i++){
+    const p=ptsArr[i];
+    const [wx,wy,wz]=b2w(p[0],p[1],p[2]);
+    pos[i*3]=wx; pos[i*3+1]=wy; pos[i*3+2]=wz;
+    const t = Math.min(1, Math.max(0, p[3]/MAX_DEPTH));
+    const [r,g,b]=jet(t);
+    col[i*3]=r; col[i*3+1]=g; col[i*3+2]=b;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setAttribute('color',   new THREE.BufferAttribute(col,3));
+  return new THREE.Points(g, new THREE.PointsMaterial({
+    size:ptSize, vertexColors:true, sizeAttenuation:true
+  }));
+}
+
+function makeSolidPoints(posArr, solidColor, ptSize){
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(posArr,3));
+  return new THREE.Points(g, new THREE.PointsMaterial({
+    size:ptSize, color:solidColor, sizeAttenuation:true, transparent:true, opacity:0.85
+  }));
+}
+
+// ── Live frame update (200 ms) ────────────────────────────────────
+function updateLive(data){
+  // Move robot body + mesh-zone arc to current world pose
+  if(data.robot_x !== undefined && robotBodyGroup && meshZoneGroup){
+    const [rx, ry, rz] = b2w(data.robot_x, data.robot_y, 0);
+    robotBodyGroup.position.set(rx, 0, rz);
+    meshZoneGroup.position.set(rx, 0, rz);
+    // Yaw: robot +X forward = Three.js +X. Y-axis flip → negate yaw for rotation.y
+    meshZoneGroup.rotation.y = data.robot_yaw;
+    robotBodyGroup.rotation.y = data.robot_yaw;
+  }
+
+  // Camera: depth-rainbow point cloud
+  disposeMesh(camLiveMesh); camLiveMesh=null;
+  if(data.pts && data.pts.length){
+    camLiveMesh = makeDepthPoints(data.pts, 0.008);
+    scene.add(camLiveMesh);
+    lastLiveTs = Date.now();
+  }
+
+  // LiDAR: laser ray beams + jet-colored hit points + wall silhouette
+  disposeMesh(lidarLivePts); lidarLivePts=null;
+  if(data.lidar_scan && data.lidar_scan.length > 1){
+    const scan=data.lidar_scan;
+    const n=scan.length;
+    const LIDAR_H=0.23;  // lidar mount height in metres
+    const MAX_R=8.0;     // max range for jet color mapping
+    const WALL_H=2.2;
+    const grp=new THREE.Group();
+
+    // 1. Ray beams: thin white lines from lidar origin to each hit point
+    const [ox,oy,oz]=b2w(0,0,LIDAR_H);
+    const rayV=new Float32Array(n*6);
+    for(let i=0;i<n;i++){
+      const [wx,wy,wz]=b2w(scan[i][0],scan[i][1],LIDAR_H);
+      rayV[i*6+0]=ox; rayV[i*6+1]=oy; rayV[i*6+2]=oz;
+      rayV[i*6+3]=wx; rayV[i*6+4]=wy; rayV[i*6+5]=wz;
+    }
+    const rayGeo=new THREE.BufferGeometry();
+    rayGeo.setAttribute('position',new THREE.BufferAttribute(rayV,3));
+    grp.add(new THREE.LineSegments(rayGeo,new THREE.LineBasicMaterial({
+      color:0xffffff, transparent:true, opacity:0.10
+    })));
+
+    // 2. Hit points — jet-colored by distance (blue=near, red=far)
+    const ptPos=new Float32Array(n*3);
+    const ptCol=new Float32Array(n*3);
+    for(let i=0;i<n;i++){
+      const [wx,wy,wz]=b2w(scan[i][0],scan[i][1],LIDAR_H);
+      ptPos[i*3]=wx; ptPos[i*3+1]=wy; ptPos[i*3+2]=wz;
+      const d=Math.sqrt(scan[i][0]**2+scan[i][1]**2);
+      const [r,g,b]=jet(Math.min(1,d/MAX_R));
+      ptCol[i*3]=r; ptCol[i*3+1]=g; ptCol[i*3+2]=b;
+    }
+    const ptGeo=new THREE.BufferGeometry();
+    ptGeo.setAttribute('position',new THREE.BufferAttribute(ptPos,3));
+    ptGeo.setAttribute('color',   new THREE.BufferAttribute(ptCol,3));
+    grp.add(new THREE.Points(ptGeo,new THREE.PointsMaterial({
+      size:0.055, vertexColors:true, sizeAttenuation:true
+    })));
+
+    // 3. Vertical wall silhouette lines at each hit point
+    const wV=new Float32Array(n*6);
+    for(let i=0;i<n;i++){
+      const [wx,,wz]=b2w(scan[i][0],scan[i][1],0);
+      wV[i*6+0]=wx; wV[i*6+1]=0;      wV[i*6+2]=wz;
+      wV[i*6+3]=wx; wV[i*6+4]=WALL_H; wV[i*6+5]=wz;
+    }
+    const wGeo=new THREE.BufferGeometry();
+    wGeo.setAttribute('position',new THREE.BufferAttribute(wV,3));
+    const wIdx=[];
+    for(let i=0;i<n;i++) wIdx.push(i*2,i*2+1);
+    wGeo.setIndex(wIdx);
+    grp.add(new THREE.LineSegments(wGeo,new THREE.LineBasicMaterial({
+      color:0x08c4d8, transparent:true, opacity:0.18
+    })));
+
+    lidarLivePts=grp;
+    scene.add(lidarLivePts);
+  }
+  refreshBadge(data.pts?data.pts.length:0);
+  applyViewMode();
+}
+
+// ── Accumulated map (3 s) ─────────────────────────────────────────
+function updateMap3D(data){
+  // LiDAR: accumulated wall points — extrude as vertical pillars + ground ring
+  disposeMesh(lidarWallMesh); lidarWallMesh=null;
+  if(data.lidar && data.lidar.length){
+    const pts=data.lidar;
+    const n=pts.length;
+    const WALL_H=2.2, WALL_STEPS=6;
+    const grp=new THREE.Group();
+
+    // Dot cloud extruded vertically
+    const totalPts=n*WALL_STEPS;
+    const pos=new Float32Array(totalPts*3);
+    let k=0;
+    for(let i=0;i<n;i++){
+      const [wx,,wz]=b2w(pts[i][0],pts[i][1],0);
+      for(let s=0;s<WALL_STEPS;s++){
+        const h=WALL_H*s/(WALL_STEPS-1);
+        pos[k++]=wx; pos[k++]=h; pos[k++]=wz;
+      }
+    }
+    const pg=new THREE.BufferGeometry();
+    pg.setAttribute('position',new THREE.BufferAttribute(pos,3));
+    grp.add(new THREE.Points(pg, new THREE.PointsMaterial({
+      size:0.022, color:0x06c8d4, sizeAttenuation:true, transparent:true, opacity:0.75
+    })));
+
+    // Ground-level footprint dots (brighter)
+    const gpos=new Float32Array(n*3);
+    for(let i=0;i<n;i++){
+      const [wx,,wz]=b2w(pts[i][0],pts[i][1],0);
+      gpos[i*3]=wx; gpos[i*3+1]=0.01; gpos[i*3+2]=wz;
+    }
+    const gg=new THREE.BufferGeometry();
+    gg.setAttribute('position',new THREE.BufferAttribute(gpos,3));
+    grp.add(new THREE.Points(gg, new THREE.PointsMaterial({
+      size:0.038, color:0x22eeff, sizeAttenuation:true, transparent:true, opacity:0.9
+    })));
+
+    lidarWallMesh=grp;
+    scene.add(lidarWallMesh);
+  }
+
+  // Camera: accumulated depth-rainbow cloud
+  disposeMesh(camAccumMesh); camAccumMesh=null;
+  if(data.camera && data.camera.length){
+    camAccumMesh = makeDepthPoints(data.camera, 0.028);
+    scene.add(camAccumMesh);
+  }
+  applyViewMode();
+}
+
+// ── Mesh rendering (from /mesh, polled every 5 s) ────────────────
+// Converts server vertex/face lists into THREE.Mesh objects.
+// Camera mesh: vertex-colored (jet depth). LiDAR mesh: teal + wireframe.
+function buildMeshGeom(vertsArr, facesArr){
+  const g = new THREE.BufferGeometry();
+  const n = vertsArr.length;
+  const pos = new Float32Array(n*3);
+  for(let i=0;i<n;i++){
+    const [wx,wy,wz] = b2w(vertsArr[i][0], vertsArr[i][1], vertsArr[i][2]);
+    pos[i*3]=wx; pos[i*3+1]=wy; pos[i*3+2]=wz;
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  const idx = new Uint32Array(facesArr.length*3);
+  for(let i=0;i<facesArr.length;i++){
+    idx[i*3]=facesArr[i][0]; idx[i*3+1]=facesArr[i][1]; idx[i*3+2]=facesArr[i][2];
+  }
+  g.setIndex(new THREE.BufferAttribute(idx,1));
+  g.computeVertexNormals();
+  return g;
+}
+
+function updateMesh(data){
+  // Tear down old mesh objects
+  [camMeshObj, camWireObj].forEach(disposeMesh);
+  camMeshObj=camWireObj=null;
+
+  let hasMesh = false;
+
+  // Camera mesh — vertex colors from server (jet depth)
+  if(data.cam && data.cam.verts && data.cam.faces){
+    const {verts, faces, colors} = data.cam;
+    const g = buildMeshGeom(verts, faces);
+    // Assign per-vertex colors
+    const col = new Float32Array(verts.length*3);
+    for(let i=0;i<colors.length;i++){
+      col[i*3]=colors[i][0]/255; col[i*3+1]=colors[i][1]/255; col[i*3+2]=colors[i][2]/255;
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(col,3));
+    camMeshObj = new THREE.Mesh(g, new THREE.MeshLambertMaterial({
+      vertexColors:true, side:THREE.DoubleSide, transparent:true, opacity:0.88
+    }));
+    // Thin wireframe overlay
+    camWireObj = new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+      color:0x000000, wireframe:true, transparent:true, opacity:0.06
+    }));
+    scene.add(camMeshObj); scene.add(camWireObj);
+    hasMesh = true;
+  }
+
+
+  document.getElementById('mesh_badge').style.display = hasMesh ? '' : 'none';
+  applyViewMode();
+}
+
+// ── View mode ──────────────────────────────────────────────────────
+function setView(mode){
+  viewMode = mode;
+  ['pts','mesh','both'].forEach(m=>{
+    document.getElementById('btn_'+m).classList.toggle('active', m===mode);
+  });
+  applyViewMode();
+}
+
+function applyViewMode(){
+  const showPts  = viewMode==='pts'  || viewMode==='both';
+  const showMesh = viewMode==='mesh' || viewMode==='both';
+  // Point cloud objects
+  [camLiveMesh, camAccumMesh, lidarWallMesh, lidarLivePts].forEach(o=>{
+    if(o) o.visible = showPts;
+  });
+  // Mesh objects
+  [camMeshObj, camWireObj].forEach(o=>{
+    if(o) o.visible = showMesh;
+  });
+}
+
+function updateRobot(pos,yaw){
+  if(robotMarker){scene.remove(robotMarker);robotMarker=null;}
+  const g=new THREE.ConeGeometry(0.09,0.24,6);
+  g.rotateX(Math.PI/2);
+  const m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0xef4444}));
+  m.position.set(pos[0],0.13,-pos[1]);
+  m.rotation.y=yaw;
+  robotMarker=m;
+  scene.add(robotMarker);
+}
+
+function refreshBadge(camPts){
+  const age=Date.now()-lastLiveTs;
+  const b=document.getElementById('sbadge');
+  const d=document.getElementById('stream_dot');
+  if(lastLiveTs===0){
+    b.textContent='○ NO SIGNAL';b.className='sbadge dead';d.style.background='#ef4444';
+  } else if(age>2000){
+    b.textContent='◔ STALE';b.className='sbadge stale';d.style.background='#f59e0b';
+  } else {
+    b.textContent='● LIVE';b.className='sbadge live';d.style.background='#10b981';
+  }
+  const lc=lidarWallMesh? (()=>{let t=0;lidarWallMesh.children.forEach(c=>{if(c.geometry&&c.geometry.attributes.position)t+=c.geometry.attributes.position.count;});return t;})():0;
+  const ac=camAccumMesh?camAccumMesh.geometry.attributes.position.count:0;
+  document.getElementById('pc_info').textContent=
+    `cam:${(camPts||0).toLocaleString()}  map:${ac.toLocaleString()}  walls:${(lc/6||0).toLocaleString()}`;
+}
+
+// ── 2-D occupancy map ─────────────────────────────────────────────
+function drawMap(m){
+  if(!m||!m.grid_b64) return;
+  const cv=document.getElementById('map_canvas'),x=cv.getContext('2d');
+  const fullW=m.size_w||m.size, fullH=m.size_h||m.size;
+  const CW=cv.width, CH=cv.height;   // fixed display size
+
+  // Decode base64 uint8 grid (0=unknown, 85=free, 170=uncertain, 255=occupied)
+  const raw=atob(m.grid_b64);
+  const u8=new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) u8[i]=raw.charCodeAt(i);
+
+  // Build RGBA image at native grid resolution
+  const fullImg=new ImageData(fullW,fullH);
+  const d=fullImg.data;
+  for(let i=0;i<u8.length;i++){
+    const p=i*4, v=u8[i]; d[p+3]=255;
+    if(v===0){          d[p]=10;  d[p+1]=12;  d[p+2]=18; }   // unknown  — near-black
+    else if(v<=85){     d[p]=230; d[p+1]=235; d[p+2]=240;}   // free     — bright off-white
+    else if(v<=170){    d[p]=55;  d[p+1]=65;  d[p+2]=85; }   // uncertain — dim blue-grey
+    else{               d[p]=18;  d[p+1]=20;  d[p+2]=28; }   // occupied — near-black walls
+  }
+
+  // Scale grid to fill the canvas (uniform scale, letter-box if non-square)
+  const scale=Math.min(CW/fullW, CH/fullH);
+  const drawW=Math.round(fullW*scale), drawH=Math.round(fullH*scale);
+  const drawX=Math.round((CW-drawW)/2), drawY=Math.round((CH-drawH)/2);
+  x.clearRect(0,0,CW,CH);
+  const off=new OffscreenCanvas(fullW,fullH);
+  off.getContext('2d').putImageData(fullImg,0,0);
+  x.drawImage(off, 0,0,fullW,fullH, drawX,drawY,drawW,drawH);
+
+  // Helper: world coords → canvas pixels.
+  // Y-axis is flipped: origin[1] = max world_Y (top of image).
+  // Moving left (+Y world) → canvas UP (smaller py). Forward (+X) → canvas RIGHT.
+  const ppm=scale/m.res;   // canvas pixels per world metre
+  function w2p(wx,wy){return [drawX+(wx-m.origin[0])*ppm, drawY+(m.origin[1]-wy)*ppm];}
+
+  // ── Grid lines every 2 m ────────────────────────────────────────
+  x.strokeStyle='rgba(59,130,246,0.10)'; x.lineWidth=0.5;
+  const gStep=2.0;
+  const worldW=fullW*m.res, worldH=fullH*m.res;
+  const gx0=Math.ceil(m.origin[0]/gStep)*gStep;
+  const gyMin=m.origin[1]-worldH, gy0=Math.ceil(gyMin/gStep)*gStep;
+  for(let wx=gx0;wx<m.origin[0]+worldW;wx+=gStep){
+    const [px]=w2p(wx,0);
+    x.beginPath();x.moveTo(px,drawY);x.lineTo(px,drawY+drawH);x.stroke();
+  }
+  for(let wy=gy0;wy<=m.origin[1]+gStep*0.5;wy+=gStep){
+    const [,py]=w2p(0,wy);
+    x.beginPath();x.moveTo(drawX,py);x.lineTo(drawX+drawW,py);x.stroke();
+  }
+
+  // ── Robot range rings (0.5 m, 1 m, 2 m, 4 m) ──────────────────
+  if(m.robot){
+    const [rcx,rcy]=w2p(m.robot[0],m.robot[1]);
+    for(const [rm,col] of [[0.5,'rgba(239,68,68,.20)'],[1,'rgba(239,68,68,.14)'],
+                            [2,'rgba(245,158,11,.10)'],[4,'rgba(59,130,246,.07)']]) {
+      const rr=rm*ppm;
+      x.beginPath();x.arc(rcx,rcy,rr,0,Math.PI*2);
+      x.strokeStyle=col; x.lineWidth=0.6; x.stroke();
+    }
+    // Range labels
+    x.fillStyle='rgba(255,255,255,.25)';x.font=`${Math.max(8,9)}px JetBrains Mono`;
+    for(const [rm,lbl] of [[1,'1m'],[2,'2m'],[4,'4m']]){
+      const [lx,ly]=w2p(m.robot[0]+rm,m.robot[1]);
+      x.fillText(lbl,lx+2,ly-2);
+    }
+  }
+
+  // ── Trail ───────────────────────────────────────────────────────
+  if(m.trail&&m.trail.length>1){
+    x.beginPath();x.strokeStyle='rgba(16,185,129,.75)';x.lineWidth=1.5;
+    for(let i=0;i<m.trail.length;i++){
+      const [px,py]=w2p(m.trail[i][0],m.trail[i][1]);
+      i===0?x.moveTo(px,py):x.lineTo(px,py);
+    }
+    x.stroke();
+  }
+
+  // ── Perimeter waypoints ─────────────────────────────────────────
+  if(m.waypoints && m.waypoints.length>0){
+    const wpIdx = m.wp_idx||0;
+    // Draw the planned loop as a cyan polygon
+    x.beginPath();
+    for(let i=0;i<m.waypoints.length;i++){
+      const [px,py]=w2p(m.waypoints[i][0],m.waypoints[i][1]);
+      i===0?x.moveTo(px,py):x.lineTo(px,py);
+    }
+    x.closePath();
+    x.strokeStyle='rgba(6,182,212,.45)';x.lineWidth=1;x.stroke();
+    // Draw each waypoint dot; highlight the current target
+    for(let i=0;i<m.waypoints.length;i++){
+      const [px,py]=w2p(m.waypoints[i][0],m.waypoints[i][1]);
+      const done=i<wpIdx, current=i===wpIdx;
+      x.beginPath();x.arc(px,py,current?4:2.5,0,Math.PI*2);
+      x.fillStyle=done?'rgba(6,182,212,.35)':current?'#06b6d4':'rgba(6,182,212,.6)';
+      x.fill();
+      if(current){
+        x.strokeStyle='rgba(255,255,255,.6)';x.lineWidth=1;x.stroke();
+      }
+    }
+  }
+
+  // ── Robot icon — scaled footprint + heading overlay ──────────────
+  if(m.robot){
+    const [rcx,rcy]=w2p(m.robot[0],m.robot[1]);
+    const yaw=m.yaw||0;
+    // Robot footprint in pixels (real-world metres × pixels-per-metre)
+    const rl=(m.robot_length||0.370)*ppm;  // front-to-back
+    const rw=(m.robot_width ||0.305)*ppm;  // side-to-side
+
+    x.save();
+    x.translate(rcx,rcy);
+    x.rotate(-yaw);   // Y-axis flipped: negate yaw so CCW world turn → CCW on screen
+
+    // 0 — soft radial glow (always at least 20px radius)
+    const glowR=Math.max(20, Math.hypot(rl,rw)/2);
+    const grd=x.createRadialGradient(0,0,4,0,0,glowR);
+    grd.addColorStop(0,'rgba(239,68,68,.28)');
+    grd.addColorStop(1,'rgba(239,68,68,0)');
+    x.beginPath();x.arc(0,0,glowR,0,Math.PI*2);
+    x.fillStyle=grd;x.fill();
+
+    // 1 — robot body rectangle (length=X-axis=forward, width=Y-axis)
+    //     semi-transparent fill + white outline
+    x.beginPath();
+    x.rect(-rl/2, -rw/2, rl, rw);
+    x.fillStyle='rgba(220,38,38,.35)';x.fill();
+    x.strokeStyle='rgba(255,255,255,.85)';x.lineWidth=1.5;x.stroke();
+
+    // 2 — forward heading cone (in front of robot nose)
+    const noseX=rl/2;
+    const CONE=Math.max(22, rl*0.5), HALF=Math.PI/7;
+    x.beginPath();x.moveTo(noseX,0);
+    x.arc(noseX,0,CONE,-HALF,HALF);
+    x.closePath();
+    x.fillStyle='rgba(239,68,68,.18)';x.fill();
+    x.strokeStyle='rgba(239,68,68,.60)';x.lineWidth=0.9;x.stroke();
+
+    // 3 — direction needle from centre to beyond nose
+    x.strokeStyle='rgba(255,255,255,.95)';x.lineWidth=2;
+    x.beginPath();x.moveTo(0,0);x.lineTo(noseX+CONE*0.7,0);x.stroke();
+    // arrowhead
+    const tip=noseX+CONE*0.7+5;
+    x.beginPath();x.moveTo(tip,0);x.lineTo(tip-6,-3.5);x.lineTo(tip-6,3.5);x.closePath();
+    x.fillStyle='#fff';x.fill();
+
+    // 4 — centre crosshair (exact position marker)
+    x.strokeStyle='rgba(255,255,255,.75)';x.lineWidth=1.2;
+    x.beginPath();x.moveTo(-5,0);x.lineTo(5,0);x.stroke();
+    x.beginPath();x.moveTo(0,-5);x.lineTo(0,5);x.stroke();
+
+    x.restore();
+  }
+
+  // ── Scale bar (bottom-right) ─────────────────────────────────────
+  {
+    const visM=fullW*m.res;   // total visible world width in metres
+    const scaleM=visM<5?1:visM<12?2:visM<25?5:10;
+    const scalePx=scaleM*ppm;
+    const bx=drawX+drawW-scalePx-12, by=drawY+drawH-10;
+    x.strokeStyle='rgba(255,255,255,.7)';x.lineWidth=2;
+    x.beginPath();x.moveTo(bx,by);x.lineTo(bx+scalePx,by);x.stroke();
+    x.beginPath();x.moveTo(bx,by-4);x.lineTo(bx,by+2);x.stroke();
+    x.beginPath();x.moveTo(bx+scalePx,by-4);x.lineTo(bx+scalePx,by+2);x.stroke();
+    x.fillStyle='rgba(255,255,255,.75)';
+    x.font=`bold 9px JetBrains Mono`;x.textAlign='center';
+    x.fillText(scaleM+'m',bx+scalePx/2,by-6);
+    x.textAlign='left';
+  }
+}
+
+// ── LiDAR radar ───────────────────────────────────────────────────
+function drawRadar(d){
+  const cv=document.getElementById('radar'),x=cv.getContext('2d'),W=cv.width,C=W/2,R=C-14;
+  x.clearRect(0,0,W,W);
+  x.fillStyle='rgba(6,8,12,.97)';x.beginPath();x.arc(C,C,R+10,0,Math.PI*2);x.fill();
+  for(let i=1;i<=4;i++){
+    x.beginPath();x.arc(C,C,R*i/4,0,Math.PI*2);
+    x.strokeStyle='rgba(59,130,246,.05)';x.lineWidth=1;x.stroke();
+  }
+  for(let a=0;a<360;a+=45){
+    const r=a*Math.PI/180;
+    x.beginPath();x.moveTo(C,C);x.lineTo(C+R*Math.sin(r),C-R*Math.cos(r));
+    x.strokeStyle='rgba(59,130,246,.04)';x.stroke();
+  }
+  x.fillStyle='rgba(62,74,92,.55)';x.font='600 7px JetBrains Mono';x.textAlign='center';
+  ['F','R','B','L'].forEach((l,i)=>{
+    const a=i*90*Math.PI/180;
+    x.fillText(l,C+(R+9)*Math.sin(a),C-(R+9)*Math.cos(a)+3);
+  });
+  if(d.histogram){
+    const n=d.histogram.length,bs=360/n;
+    for(let i=0;i<n;i++){
+      const h=d.histogram[i],nr=Math.min(1,Math.max(.03,1-h/6000))*R;
+      const s=(i*bs-90)*Math.PI/180,e=((i+1)*bs-90)*Math.PI/180;
+      x.beginPath();x.moveTo(C,C);x.arc(C,C,nr,s,e);x.closePath();
+      x.fillStyle=h<300?'rgba(239,68,68,.18)':h<600?'rgba(245,158,11,.09)':'rgba(59,130,246,.025)';
+      x.fill();
+    }
+  }
+  if(d.points){
+    // Scan contour polygon — filled silhouette of the environment outline
+    const sortedAng=Object.keys(d.points).map(Number).sort((a,b)=>a-b);
+    if(sortedAng.length>3){
+      x.beginPath();let fs=true;
+      for(const a of sortedAng){
+        const dist=d.points[a];if(dist<10||dist>7500)continue;
+        const rd=(a-90)*Math.PI/180,rr=Math.min(dist/6000,1)*R;
+        const px=C+rr*Math.cos(rd),py=C+rr*Math.sin(rd);
+        fs?(x.moveTo(px,py),fs=false):x.lineTo(px,py);
+      }
+      x.closePath();
+      x.fillStyle='rgba(30,80,160,.09)';x.fill();
+      x.strokeStyle='rgba(59,130,246,.55)';x.lineWidth=1.2;x.stroke();
+    }
+    // Individual scan dots drawn on top of the polygon
+    for(const[as,dist]of Object.entries(d.points)){
+      const a=parseFloat(as),rd=(a-90)*Math.PI/180,rr=Math.min(dist/6000,1)*R;
+      x.beginPath();x.arc(C+rr*Math.cos(rd),C+rr*Math.sin(rd),1.3,0,Math.PI*2);
+      x.fillStyle=dist<300?'rgba(239,68,68,.85)':dist<600?'rgba(245,158,11,.55)':'rgba(59,130,246,.28)';
+      x.fill();
+    }
+  }
+  if(d.target_heading>=0){
+    const a=(d.target_heading-90)*Math.PI/180,l=R*.55;
+    x.beginPath();x.moveTo(C,C);x.lineTo(C+l*Math.cos(a),C+l*Math.sin(a));
+    x.strokeStyle='rgba(6,182,212,.55)';x.lineWidth=2;x.stroke();
+  }
+  x.beginPath();x.arc(C,C,3.5,0,Math.PI*2);x.fillStyle='#3b82f6';x.fill();
+}
+
+// ── Polling ───────────────────────────────────────────────────────
+const ZN=["FRONT","FRONT_RIGHT","RIGHT","BACK_RIGHT","BACK","BACK_LEFT","LEFT","FRONT_LEFT"];
+let camOk=false;
+
+async function pollData(){
+  try{
+    const d=await(await fetch('/data')).json();
+    lastScan = d.points || {};
+    drawRadar(d);
+    const sb=document.getElementById('sbadge2');
+    sb.textContent=d.state||'?';
+    sb.className='badge'+(
+      d.state&&d.state.includes('EMER')?' danger':
+      (d.state==='TRAPPED'||d.state==='UNSTUCK')?' warn':' ok'
+    );
+    document.getElementById('sdetail').textContent=d.detail||'';
+    const z=d.zones||{};
+    let zh='';
+    ZN.forEach(n=>{
+      const v=z[n]||9999;
+      zh+=`<div class="zr${v<300?' zd':v<600?' zw':''}"><span>${n}</span><span>${v}mm</span></div>`;
+    });
+    document.getElementById('zones').innerHTML=zh;
+    document.getElementById('ml').textContent=d.left_rpm||0;
+    document.getElementById('mr').textContent=d.right_rpm||0;
+    document.getElementById('lpts').textContent=(d.lidar_pts||0).toLocaleString();
+    document.getElementById('cpts').textContent=(d.cam_pts||0).toLocaleString();
+    document.getElementById('tgt').textContent=d.target_heading>=0?d.target_heading.toFixed(0)+'°':'—';
+    document.getElementById('frm').textContent=d.frame||0;
+    const p=d.position||[0,0,0];
+    document.getElementById('pos').textContent=p[0].toFixed(1)+', '+p[1].toFixed(1);
+    if(d.imu)document.getElementById('imu').textContent=
+      d.imu.roll.toFixed(0)+' '+d.imu.pitch.toFixed(0)+' '+d.imu.yaw.toFixed(0);
+    document.getElementById('p_lid').className='pill '+(d.points&&Object.keys(d.points).length?'on':'off');
+    document.getElementById('p_imu').className='pill '+(d.imu?'on':'off');
+    document.getElementById('p_cam').className='pill '+(camOk?'on':'off');
+  }catch(e){}
+  setTimeout(pollData,200);
+}
+
+async function pollLive3D(){
+  try{
+    const d=await(await fetch('/stream3d')).json();
+    if(d)updateLive(d);
+  }catch(e){refreshBadge(0);}
+  setTimeout(pollLive3D,200);
+}
+
+async function pollMap3D(){
+  try{
+    const d=await(await fetch('/map3d')).json();
+    if(d&&(d.lidar||d.camera))updateMap3D(d);
+  }catch(e){}
+  setTimeout(pollMap3D,3000);
+}
+
+async function pollCam(){
+  try{
+    const r=await fetch('/camera');
+    if(r.ok){
+      const b=await r.blob();
+      const img=document.getElementById('cam_img');
+      img.src=URL.createObjectURL(b);img.style.display='block';
+      document.getElementById('cam_ph').style.display='none';
+      camOk=true;document.getElementById('cd').style.background='var(--green)';
+    }else{camOk=false;document.getElementById('cd').style.background='var(--red)';}
+  }catch(e){camOk=false;}
+  setTimeout(pollCam,250);
+}
+
+async function pollMap2D(){
+  try{
+    const m=await(await fetch('/map')).json();
+    drawMap(m);
+    if(m&&m.robot)updateRobot(m.robot,m.yaw||0);
+  }catch(e){}
+  setTimeout(pollMap2D,500);
+}
+
+async function pollMesh(){
+  try{
+    const d=await(await fetch('/mesh')).json();
+    updateMesh(d||{});  // always call — empty response tears down stale geometry
+  }catch(e){}
+  setTimeout(pollMesh, 5000);  // mesh rebuilds every ~3 s server-side, poll every 5 s
+}
+
+init3D();
+window.addEventListener('resize',()=>{
+  const c=document.getElementById('three_box');
+  if(c&&ren){const w=c.clientWidth,h=c.clientHeight||320;ren.setSize(w,h);cam3.aspect=w/h;cam3.updateProjectionMatrix();}
+});
+pollData(); pollCam(); pollMap2D(); pollLive3D(); pollMap3D(); pollMesh();
+</script>
+</body>
+</html>
