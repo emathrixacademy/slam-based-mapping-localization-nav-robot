@@ -9,6 +9,7 @@ Exports:
 import math
 import struct
 import threading
+import time
 import serial
 
 from config import (
@@ -20,14 +21,22 @@ from config import (
 class LD06:
     """LD06 LiDAR serial driver. Runs a background thread to collect scans."""
 
+    # Max bytes kept in the parse buffer = 40 packets × 47 bytes.
+    # If the thread falls behind (GIL starvation), older bytes are discarded
+    # instead of letting the buffer grow unboundedly and the O(N) index() scan
+    # getting slower with each iteration (positive-feedback hang).
+    _BUFFER_MAX = 40 * 47   # ~1 880 bytes ≈ 1 full LiDAR revolution
+
     def __init__(self, port="/dev/ttyTHS1", offset=270):
         self.offset    = offset
-        self.ser       = serial.Serial(port, 230400, timeout=1.0)
+        # timeout=0.05: non-blocking read; never stall the thread >50 ms per call
+        self.ser       = serial.Serial(port, 230400, timeout=0.05)
         self.ser.reset_input_buffer()
         self._buffer   = bytearray()
         self.scan_data = {}
         self.raw_scan  = {}
         self._lock     = threading.Lock()
+        self._scan_ts  = 0.0   # monotonic time of last published scan
         self._running  = False
         self._thread   = None
 
@@ -42,14 +51,27 @@ class LD06:
         current_raw  = {}
 
         while self._running:
-            # Read all bytes waiting in the OS buffer (min 1 packet = 47 bytes).
-            # Draining the full buffer each call avoids repeated tiny reads
-            # and reduces the number of system calls per second.
+            # Read whatever the OS has buffered (non-blocking; timeout=0.05 s).
             n_wait   = self.ser.in_waiting
-            incoming = self.ser.read(n_wait if n_wait >= 47 else 47)
+            to_read  = max(n_wait, 47)
+            incoming = self.ser.read(to_read)
             if not incoming:
+                time.sleep(0.005)   # nothing yet — yield briefly then retry
                 continue
             self._buffer.extend(incoming)
+
+            # ── Buffer cap ────────────────────────────────────────────
+            # If the thread fell behind (GIL starvation, heavy main-loop tick),
+            # drop the oldest bytes rather than letting the buffer grow and making
+            # the index() scan O(N²).  Keep only the most recent _BUFFER_MAX bytes,
+            # re-aligned to the next 0x54 sync byte so we don't parse mid-packet.
+            if len(self._buffer) > self._BUFFER_MAX:
+                tail = self._buffer[-self._BUFFER_MAX:]
+                try:
+                    sync = tail.index(0x54)
+                    self._buffer = tail[sync:]
+                except ValueError:
+                    self._buffer.clear()
 
             while len(self._buffer) >= 47:
                 try:
@@ -97,6 +119,7 @@ class LD06:
                             with self._lock:
                                 self.scan_data = current.copy()
                                 self.raw_scan  = current_raw.copy()
+                                self._scan_ts  = time.monotonic()  # timestamp this scan
                             current.clear()
                             current_raw.clear()
 
@@ -105,6 +128,15 @@ class LD06:
     def get_scan(self) -> dict:
         with self._lock:
             return self.scan_data.copy()
+
+    def get_scan_age(self) -> float:
+        """Seconds since the last complete scan was published. Returns inf if none yet."""
+        ts = self._scan_ts
+        return (time.monotonic() - ts) if ts > 0 else float('inf')
+
+    def is_stale(self, max_age: float = 0.5) -> bool:
+        """True if no new scan has arrived within max_age seconds."""
+        return self.get_scan_age() > max_age
 
     def get_raw_scan(self) -> dict:
         with self._lock:

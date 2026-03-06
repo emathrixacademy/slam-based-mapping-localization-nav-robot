@@ -148,6 +148,15 @@ canvas.radar{display:block;margin:0 auto;max-width:100%;border-radius:50%}
   justify-content:center;font-size:1rem;cursor:pointer;z-index:100;
   box-shadow:0 4px 20px rgba(239,68,68,.3)
 }
+
+/* ── Download buttons ── */
+.dl_btn{
+  padding:2px 8px;border-radius:5px;font-size:.52rem;font-family:'JetBrains Mono',monospace;
+  font-weight:600;cursor:pointer;border:1px solid rgba(16,185,129,.25);color:var(--green);
+  background:rgba(16,185,129,.06);letter-spacing:.3px;margin-left:6px;
+  transition:all .15s;flex-shrink:0
+}
+.dl_btn:hover{border-color:var(--green);background:rgba(16,185,129,.14)}
 </style>
 </head>
 <body>
@@ -185,6 +194,7 @@ canvas.radar{display:block;margin:0 auto;max-width:100%;border-radius:50%}
         <button class="vtbtn"        id="btn_mesh" onclick="setView('mesh')">MESH</button>
         <button class="vtbtn"        id="btn_both" onclick="setView('both')">BOTH</button>
       </div>
+      <button class="dl_btn" onclick="download3DMap()" title="Save current 3D view as PNG">⬇ 3D PNG</button>
     </div>
     <div class="cb" style="padding:0;position:relative">
       <div id="three_box">
@@ -226,6 +236,7 @@ canvas.radar{display:block;margin:0 auto;max-width:100%;border-radius:50%}
     <div class="ch">
       <div class="dot"></div>2D SLAM Map
       <span style="color:var(--dim);font-weight:400;font-size:.6rem;margin-left:4px">occupancy grid · log-odds</span>
+      <button class="dl_btn" onclick="download2DMap()" title="Save 2D map as PNG">⬇ 2D PNG</button>
     </div>
     <div class="cb" style="padding:4px">
       <div id="map_wrap">
@@ -333,7 +344,7 @@ function init3D(){
   scene.fog=new THREE.FogExp2(0x06080c, 0.038);
   cam3=new THREE.PerspectiveCamera(50,w/h,0.05,120);
   orbitCam();
-  ren=new THREE.WebGLRenderer({antialias:true});
+  ren=new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true});
   ren.setSize(w,h);
   ren.setPixelRatio(Math.min(window.devicePixelRatio,1.5));
   el.appendChild(ren.domElement);
@@ -957,6 +968,116 @@ function drawRadar(d){
     x.strokeStyle='rgba(6,182,212,.55)';x.lineWidth=2;x.stroke();
   }
   x.beginPath();x.arc(C,C,3.5,0,Math.PI*2);x.fillStyle='#3b82f6';x.fill();
+}
+
+// ── Map downloads ─────────────────────────────────────────────────
+function _dlTimestamp(){
+  return new Date().toISOString().replace('T',' ').slice(0,19)+' UTC';
+}
+
+function download2DMap(){
+  const src=document.getElementById('map_canvas');
+  if(!src.width||!src.height){alert('No 2D map data yet.');return;}
+
+  const PAD_TOP=40, PAD_BOT=32;
+  const W=src.width, H=src.height;
+  const out=document.createElement('canvas');
+  out.width=W; out.height=H+PAD_TOP+PAD_BOT;
+  const c=out.getContext('2d');
+
+  // Background
+  c.fillStyle='#060810'; c.fillRect(0,0,out.width,out.height);
+
+  // Map content
+  c.drawImage(src,0,PAD_TOP);
+
+  // ── Title bar ──
+  c.fillStyle='rgba(6,8,16,.9)'; c.fillRect(0,0,W,PAD_TOP);
+  // Left: title
+  c.fillStyle='#e8ecf2'; c.font='bold 14px "JetBrains Mono",monospace';
+  c.textBaseline='middle'; c.textAlign='left';
+  c.fillText('SLAM 2D Occupancy Map',12,PAD_TOP/2);
+  // Right: timestamp
+  c.fillStyle='#3e4a5c'; c.font='10px "JetBrains Mono",monospace';
+  c.textAlign='right';
+  c.fillText(_dlTimestamp(),W-12,PAD_TOP/2);
+
+  // ── Bottom legend bar ──
+  c.fillStyle='rgba(6,8,16,.85)'; c.fillRect(0,H+PAD_TOP,W,PAD_BOT);
+  const lgItems=[['#dce2ea','Free'],['#ffffff','Wall'],
+                 ['#1e2430','Unknown'],['#10b981','Trail'],['#ef4444','Robot']];
+  const ly=H+PAD_TOP+PAD_BOT/2;
+  let lx=12;
+  c.textAlign='left'; c.textBaseline='middle';
+  for(const[col,lbl] of lgItems){
+    // Swatch
+    c.fillStyle=col; c.fillRect(lx,ly-5,9,9);
+    // Outline swatch so white swatch is visible on dark
+    c.strokeStyle='rgba(255,255,255,.15)'; c.lineWidth=0.5;
+    c.strokeRect(lx,ly-5,9,9);
+    // Label
+    c.fillStyle='#6b7a90'; c.font='9px "JetBrains Mono",monospace';
+    c.fillText(lbl,lx+12,ly);
+    lx+=12+c.measureText(lbl).width+16;
+  }
+
+  _triggerDownload(out,'slam_2d_map');
+}
+
+function download3DMap(){
+  if(!ren){alert('3D viewer not ready.');return;}
+  // Force a fresh render so preserveDrawingBuffer has the latest frame
+  ren.render(scene,cam3);
+  const src=ren.domElement;
+
+  const PAD_TOP=40, PAD_BOT=28;
+  const W=src.width, H=src.height;
+  const out=document.createElement('canvas');
+  out.width=W; out.height=H+PAD_TOP+PAD_BOT;
+  const c=out.getContext('2d');
+
+  // Background
+  c.fillStyle='#06080c'; c.fillRect(0,0,out.width,out.height);
+
+  // 3D canvas content
+  c.drawImage(src,0,PAD_TOP);
+
+  // ── Title bar ──
+  c.fillStyle='rgba(6,8,12,.9)'; c.fillRect(0,0,W,PAD_TOP);
+  c.fillStyle='#e8ecf2'; c.font='bold 14px "JetBrains Mono",monospace';
+  c.textBaseline='middle'; c.textAlign='left';
+  c.fillText('SLAM 3D Point Cloud',12,PAD_TOP/2);
+  c.fillStyle='#3e4a5c'; c.font='10px "JetBrains Mono",monospace';
+  c.textAlign='right';
+  c.fillText(_dlTimestamp(),W-12,PAD_TOP/2);
+
+  // ── Bottom legend bar ──
+  c.fillStyle='rgba(6,8,12,.85)'; c.fillRect(0,H+PAD_TOP,W,PAD_BOT);
+  const lgItems3=[['#22eeff','LiDAR walls'],['#3b82f6','Camera (near)'],['#ef4444','Camera (far)']];
+  let lx3=12;
+  c.textAlign='left'; c.textBaseline='middle';
+  const ly3=H+PAD_TOP+PAD_BOT/2;
+  for(const[col,lbl] of lgItems3){
+    c.fillStyle=col; c.fillRect(lx3,ly3-5,9,9);
+    c.fillStyle='#6b7a90'; c.font='9px "JetBrains Mono",monospace';
+    c.fillText(lbl,lx3+12,ly3);
+    lx3+=12+c.measureText(lbl).width+16;
+  }
+  // View angle hint
+  c.fillStyle='#2a3444'; c.font='9px "JetBrains Mono",monospace';
+  c.textAlign='right';
+  c.fillText(`view θ=${(theta*(180/Math.PI)).toFixed(0)}° φ=${(phi*(180/Math.PI)).toFixed(0)}° d=${dist.toFixed(1)}m`,
+             W-12,ly3);
+
+  _triggerDownload(out,'slam_3d_map');
+}
+
+function _triggerDownload(canvas,basename){
+  const ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+  const a=document.createElement('a');
+  a.href=canvas.toDataURL('image/png');
+  a.download=`${basename}_${ts}.png`;
+  a.click();
 }
 
 // ── Polling ───────────────────────────────────────────────────────

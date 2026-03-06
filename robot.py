@@ -177,6 +177,7 @@ class SLAMAvoidanceRobot:
         self._cam_latest_xyz     = None   # last captured xyz (camera optical frame)
         self._cam_latest_img     = None   # last captured BGR image
         self._cam_latest_depth_m = None   # last captured depth map (HxW float32)
+        self._cam_latest_yaw     = 0.0    # robot heading (rad) at camera capture time
         self._cam_frame_lock     = threading.Lock()
 
         # ── VFH ──
@@ -301,8 +302,9 @@ class SLAMAvoidanceRobot:
         self._acc_mesh_verts  = np.empty((0, 3), dtype=np.float32)
         self._acc_mesh_faces  = np.empty((0, 3), dtype=np.int32)
         self._acc_mesh_colors = np.empty((0, 3), dtype=np.float32)
-        # Voxel tracking: packed int64 keys of world cells already BPA'd (0.08 m grid)
-        self.TRACK_VOXEL    = 0.08
+        # Voxel tracking: packed int64 keys of world cells already BPA'd (0.05 m grid)
+        # Finer than before → smaller patches → more detail per BPA chunk
+        self.TRACK_VOXEL    = 0.05
         self._meshed_voxels = np.empty(0, dtype=np.int64)   # sorted
         # Only mesh points whose optical-Z depth is within this range (metres).
         # Lower bound keeps "in-flux" close points out; upper bound matches camera range.
@@ -312,6 +314,13 @@ class SLAMAvoidanceRobot:
         self._last_tick_time = time.time()   # for computing dt between ticks
         # Hector motion gate: only update map when robot has moved ≥3 cm or ≥2°
         self._last_map_update_pose = np.array([0.0, 0.0, 0.0])  # [x, y, yaw]
+        # Stale-scan guard: track last lidar scan timestamp to detect lidar hangs
+        self._last_lid_scan_ts   = 0.0
+        self._stale_warn_printed = False
+        # Scan motion de-skew: correct per-point heading error during rotation
+        self._prev_map_yaw    = 0.0   # heading at end of previous tick
+        self._prev_yaw_rate   = 0.0   # rad/s yaw-rate estimate (from previous tick)
+        self._prev_lid_scan_ts = 0.0  # scan_ts of previous fresh scan (for T_scan)
 
         # ── Live 3-D stream buffer (single raw frame in base frame) ──
         self._live_frame_xyz   = None   # Nx3 float32
@@ -382,6 +391,48 @@ class SLAMAvoidanceRobot:
         time.sleep(0.5 + random.random() * 0.8)
         self._front_history.clear()
 
+    # ── LiDAR scan motion de-skew ─────────────────────────────────
+    def _deskew_scan(self, scan_dict, omega_z, T_scan):
+        """
+        Correct each scan point for the robot rotation that occurred DURING the scan.
+
+        The LD06 spins CW at ~10 Hz: a full revolution takes T_scan seconds.
+        A point at CW angle α (0–360°) was captured (1 – α/360) × T_scan seconds
+        before the scan completed.  If the robot was rotating at omega_z rad/s
+        (CCW positive) it had a DIFFERENT heading at capture time.
+
+        Correction: rotate each point by  –omega_z × (1 – α/360) × T_scan
+        so all points are expressed in the sensor frame at scan-end time.
+        """
+        from config import np
+        if not scan_dict:
+            return scan_dict
+        angles = np.fromiter(scan_dict.keys(),   dtype=np.float32, count=len(scan_dict))
+        dists  = np.fromiter(scan_dict.values(), dtype=np.float32, count=len(scan_dict))
+
+        # Time elapsed before scan end for each point (s)
+        t_before = (1.0 - angles / 360.0) * np.float32(T_scan)
+
+        # Per-point correction angle (CCW radians): cancel the heading change
+        corr = (-omega_z * t_before).astype(np.float32)
+
+        # Sensor-frame XY  (CW convention: x=forward, y=left)
+        d   = dists * np.float32(1e-3)       # mm → m
+        ar  = np.deg2rad(angles)
+        px  =  d * np.cos(ar)
+        py  = -d * np.sin(ar)
+
+        # Rotate each point back to capture-time sensor frame
+        cos_c, sin_c = np.cos(corr), np.sin(corr)
+        px_c = px * cos_c - py * sin_c
+        py_c = px * sin_c + py * cos_c
+
+        # Back to CW polar
+        new_d_mm = np.hypot(px_c, py_c) * 1000.0
+        new_ang  = np.degrees(np.arctan2(-py_c, px_c)) % 360.0
+        return {round(float(a), 1): round(float(d))
+                for a, d in zip(new_ang, new_d_mm)}
+
     # ── Background camera capture ─────────────────────────────────
     def _camera_loop(self):
         """
@@ -399,6 +450,7 @@ class SLAMAvoidanceRobot:
                         self._cam_latest_xyz     = xyz
                         self._cam_latest_img     = img
                         self._cam_latest_depth_m = depth_m
+                        self._cam_latest_yaw     = self._map_yaw  # snapshot heading at capture time
             except Exception:
                 time.sleep(0.05)
 
@@ -434,7 +486,42 @@ class SLAMAvoidanceRobot:
             except Exception: pass
 
         # LiDAR → base frame, then filter robot-body reflections (< 150 mm)
-        scan     = self.lidar.get_scan()
+        scan         = self.lidar.get_scan()
+        _lid_scan_ts = self.lidar._scan_ts
+        _lid_fresh   = _lid_scan_ts > self._last_lid_scan_ts
+        if _lid_fresh:
+            self._last_lid_scan_ts   = _lid_scan_ts
+            self._stale_warn_printed = False
+        else:
+            # Lidar has not produced a new scan since the last tick.
+            # DO NOT clear scan — the main loop checks `if not scan` and would
+            # enter WAIT_LIDAR (stopping motors + all dashboard updates) if empty.
+            # Instead keep scan for navigation/display and use _lid_fresh=False
+            # to skip only the Hector registration and map accumulation below.
+            if not self._stale_warn_printed:
+                age = self.lidar.get_scan_age()
+                print(f"[LiDAR] WARNING: stale scan ({age:.2f}s old) — "
+                      f"skipping Hector/map update until fresh data arrives")
+                self._stale_warn_printed = True
+
+        # ── Scan motion de-skew ────────────────────────────────────
+        # Best angular-velocity source: IMU gyro Z (direct measurement).
+        # Fallback: Hector yaw-rate estimate from the previous tick.
+        _omega_z = self._prev_yaw_rate
+        if imu_data is not None:
+            _gz = float(imu_data["gyro"][2]) * self.config.get("IMU_GYRO_SIGN", 1.0)
+            if abs(_gz) > 0.02:   # 1.1°/s low deadband — de-skew benefits even slow turns
+                _omega_z = _gz
+        if _lid_fresh and scan and abs(_omega_z) > math.radians(1.0):
+            # T_scan from consecutive scan timestamps (real period, not fixed 0.1s)
+            _T_scan = (_lid_scan_ts - self._prev_lid_scan_ts
+                       if self._prev_lid_scan_ts > 0
+                       and 0.05 < _lid_scan_ts - self._prev_lid_scan_ts < 0.30
+                       else 0.10)
+            scan = self._deskew_scan(scan, _omega_z, _T_scan)
+        if _lid_fresh:
+            self._prev_lid_scan_ts = _lid_scan_ts
+
         lid_3d   = lidar_to_3d(scan, height=0.0)
         lid_base = (transform_points(lid_3d, self.T_base_lid)
                     if len(lid_3d) > 0 else lid_3d)
@@ -448,11 +535,13 @@ class SLAMAvoidanceRobot:
         cam_depth = np.empty((0,),   dtype=np.float32)  # optical-Z depth (metres)
         cam_img   = None
         depth_m   = None   # raw depth in metres for RGB-D odometry
+        cam_yaw = self._map_yaw   # heading at camera capture time (updated below)
         if self.camera:
             with self._cam_frame_lock:
                 cam_xyz = self._cam_latest_xyz
                 cam_img = self._cam_latest_img
                 depth_m = self._cam_latest_depth_m
+                cam_yaw = self._cam_latest_yaw   # heading when this frame was captured
             if cam_xyz is not None and len(cam_xyz) > 0:
                 cam_base  = self._xform(cam_xyz, self.T_base_cam)
                 cam_depth = cam_xyz[:, 2].astype(np.float32)  # Z = depth in optical frame
@@ -470,9 +559,14 @@ class SLAMAvoidanceRobot:
         lid_world = np.empty((0, 3), dtype=np.float32)   # filled after pose update
 
         # ── RGB-D Visual Odometry (6-DOF backup / Z-axis) ─────────
+        # Skip during fast rotation: if heading changed >5° since camera capture,
+        # the frame is too stale for reliable odometry and would cause drift.
+        _yaw_delta_cam = abs(self._map_yaw - cam_yaw)
+        _fast_rotation = _yaw_delta_cam > math.radians(5.0)
         T_rgbd_cam = np.eye(4, dtype=np.float64)
         rgbd_ok    = False
-        if self.rgbd_odom is not None and depth_m is not None and cam_img is not None:
+        if (self.rgbd_odom is not None and depth_m is not None
+                and cam_img is not None and not _fast_rotation):
             try:
                 T_rgbd_cam, rgbd_ok = self.rgbd_odom.push_frame(cam_img, depth_m)
             except Exception:
@@ -498,8 +592,9 @@ class SLAMAvoidanceRobot:
                     imu_predicted_yaw)
 
         # ── Hector SLAM 2D (primary odometry: scan-to-map) ────────
+        # Only register a fresh scan — re-registering the same scan causes drift.
         h_fitness = 0.0
-        if len(lid_base) >= 20 and self._hector_frames >= 5:
+        if _lid_fresh and len(lid_base) >= 20 and self._hector_frames >= 5:
             scan_2d   = lid_base[:, :2].astype(np.float64)
             h_fitness = self.hector.register(scan_2d)
 
@@ -559,23 +654,30 @@ class SLAMAvoidanceRobot:
             self.hector.set_pose(float(self.T_map_base[0, 3]),
                                  float(self.T_map_base[1, 3]), self._map_yaw)
 
+        # ── Update yaw-rate estimate for next tick's scan de-skew ─
+        # Use dt computed earlier in the IMU section.
+        self._prev_yaw_rate = (self._map_yaw - self._prev_map_yaw) / max(dt, 0.02)
+        self._prev_map_yaw  = self._map_yaw
+
         # ── Update Hector map from world-frame LiDAR points ───────
         # Motion gate: only update the map if the robot has moved ≥3 cm or
         # rotated ≥2° — prevents vibration from smearing occupied cells.
+        # Also only update on fresh scans — re-painting the same scan smears walls.
         if len(lid_base) > 0:
             lid_world = transform_points(lid_base, self.T_map_base)
-            _cx = float(self.T_map_base[0, 3])
-            _cy = float(self.T_map_base[1, 3])
-            _moved = math.hypot(_cx - self._last_map_update_pose[0],
-                                 _cy - self._last_map_update_pose[1])
-            _rotated = abs(self._map_yaw - self._last_map_update_pose[2])
-            if _moved > 0.03 or _rotated > math.radians(2) or self._hector_frames < 10:
-                self.hector.update_map(lid_world[:, :2])
-                self._hector_frames += 1
-                self._last_map_update_pose = np.array([_cx, _cy, self._map_yaw])
+            if _lid_fresh:
+                _cx = float(self.T_map_base[0, 3])
+                _cy = float(self.T_map_base[1, 3])
+                _moved = math.hypot(_cx - self._last_map_update_pose[0],
+                                     _cy - self._last_map_update_pose[1])
+                _rotated = abs(self._map_yaw - self._last_map_update_pose[2])
+                if _moved > 0.03 or _rotated > math.radians(2) or self._hector_frames < 10:
+                    self.hector.update_map(lid_world[:, :2])
+                    self._hector_frames += 1
+                    self._last_map_update_pose = np.array([_cx, _cy, self._map_yaw])
 
         # ── Loop closure: keyframe + detection (background thread) ─
-        if (self.frame_count % 30 == 0 and not self._loop_building
+        if (_lid_fresh and self.frame_count % 30 == 0 and not self._loop_building
                 and len(lid_base) > 0):
             self._loop_building = True
             pose_snap = self.hector.get_pose()
@@ -597,6 +699,15 @@ class SLAMAvoidanceRobot:
 
         # TSDF integration removed — using BPA full-rebuild instead
 
+        # ── Build capture-time T_map_base for camera→world transforms ──
+        # Camera frames are captured asynchronously; during rotation the heading at
+        # capture time (cam_yaw) differs from the post-Hector heading (_map_yaw).
+        # Use the capture-time yaw so camera points land in the right world position.
+        _cy, _sy = math.cos(cam_yaw), math.sin(cam_yaw)
+        T_map_base_cam = self.T_map_base.copy()
+        T_map_base_cam[0, 0] =  _cy; T_map_base_cam[0, 1] = -_sy
+        T_map_base_cam[1, 0] =  _sy; T_map_base_cam[1, 1] =  _cy
+
         # ── Live stream in world frame (pose already updated) ──────
         # LiDAR: angle-sort world-frame scan points so polyline closes correctly
         _lidar_scan_world = []
@@ -608,8 +719,8 @@ class SLAMAvoidanceRobot:
             _lidar_scan_world = [[round(float(lid_world[i, 0]), 3),
                                    round(float(lid_world[i, 1]), 3)]
                                   for i in order]
-        # Camera: world-frame live cloud
-        _cam_world_live = (self._xform(cam_base, self.T_map_base)
+        # Camera: world-frame live cloud (use capture-time rotation to fix desync)
+        _cam_world_live = (self._xform(cam_base, T_map_base_cam)
                            if len(cam_base) > 0 else None)
         with self._live_frame_lock:
             self._live_frame_xyz   = _cam_world_live
@@ -646,15 +757,16 @@ class SLAMAvoidanceRobot:
             if len(self.robot_trail) > 5000:
                 self.robot_trail = self.robot_trail[-5000:]
 
-        # Accumulate LiDAR wall map (lid_world already in world frame from pose block)
-        if len(lid_world) > 0:
+        # Accumulate LiDAR wall map — only on fresh scans to avoid duplicating the same
+        # points at the same world position every tick (wastes memory, no new info).
+        if _lid_fresh and len(lid_world) > 0:
             self.lidar_map = (np.vstack([self.lidar_map, lid_world])
                               if len(self.lidar_map) > 0 else lid_world.copy())
 
         # Accumulate camera depth map — pre-downsample each new batch so only
         # unique voxels enter the map (prevents runaway 22k-pts/frame growth).
         if len(cam_base) > 0:
-            cam_world    = self._xform(cam_base, self.T_map_base)
+            cam_world    = self._xform(cam_base, T_map_base_cam)  # capture-time rotation
             ds_idx       = voxel_downsample_idx(cam_world, self.MAP_VOXEL)
             cam_world    = cam_world[ds_idx]
             cam_depth_ds = cam_depth[ds_idx]
@@ -686,8 +798,8 @@ class SLAMAvoidanceRobot:
                            else (parts_all[0] if parts_all
                                  else np.empty((0, 3), dtype=np.float32)))
 
-        # Occupancy grid
-        if scan:
+        # Occupancy grid — only ray-cast on fresh scans (same scan re-cast smears walls)
+        if _lid_fresh and scan:
             self._update_occupancy_from_scan(scan)
         if self.frame_count % 3 == 0:
             with self._occ_lock:
@@ -991,10 +1103,21 @@ class SLAMAvoidanceRobot:
     # ── Mesh reconstruction (incremental BPA camera mesh) ───────────
     def _rebuild_mesh(self):
         """
-        Incremental BPA mesh from live camera frame.
-        Only voxels not yet meshed are processed each pass —
-        mesh grows as the robot moves into new areas.
-        Depth colormap: blue=near, red=far (jet).
+        Incremental BPA mesh — enhanced for 3D quality:
+
+        Sources from both the live camera frame (fine detail at current view)
+        AND the accumulated cam_map_xyz (multi-frame context density).  A 1-voxel
+        border of already-meshed cells is included so new patches stitch cleanly
+        to existing geometry.
+
+        Key upgrades vs old version:
+          • Accumulated map supplement → far denser BPA input per patch
+          • 1-voxel context border → no seam gaps at patch boundaries
+          • TRACK_VOXEL 0.05 m → finer mesh resolution
+          • 5-tier BPA radii (micro → macro gap fill)
+          • orient_normals_consistent_tangent_plane → smoother surfaces
+          • 15 Taubin iterations → better surface quality
+          • MAX_ACC_VERTS 300k + voxel-reset on trim → no ghost holes on revisit
         """
         from config import np
         _import_o3d()
@@ -1004,7 +1127,7 @@ class SLAMAvoidanceRobot:
             self._mesh_building = False
             return
 
-        # ── Grab live camera frame (world coords) ─────────────────────
+        # ── Grab live camera frame (world coords, high-density current view) ─
         with self._live_frame_lock:
             if self._live_frame_xyz is None or len(self._live_frame_xyz) < 100:
                 self._mesh_building = False
@@ -1018,17 +1141,17 @@ class SLAMAvoidanceRobot:
 
         from lidar import voxel_downsample_idx
 
-        # ── Voxel downsample ──────────────────────────────────────────
-        BPA_MAX   = 12000
-        BPA_VOXEL = 0.015
+        # ── Voxel downsample live frame ────────────────────────────────
+        BPA_MAX   = 16000   # more points → denser mesh per patch
+        BPA_VOXEL = 0.012   # finer than before → higher detail
 
         ds_idx    = voxel_downsample_idx(xyz_live.astype(np.float32), BPA_VOXEL)
         bpa_xyz   = xyz_live[ds_idx].astype(np.float64)
         bpa_depth = depth_live[ds_idx]
 
         if len(bpa_xyz) > BPA_MAX:
-            coarser = BPA_VOXEL * (len(bpa_xyz) / BPA_MAX) ** (1/3)
-            ds2     = voxel_downsample_idx(bpa_xyz.astype(np.float32), float(coarser))
+            coarser   = BPA_VOXEL * (len(bpa_xyz) / BPA_MAX) ** (1/3)
+            ds2       = voxel_downsample_idx(bpa_xyz.astype(np.float32), float(coarser))
             bpa_xyz   = bpa_xyz[ds2]
             bpa_depth = bpa_depth[ds2]
 
@@ -1041,7 +1164,7 @@ class SLAMAvoidanceRobot:
         bpa_depth = bpa_depth[near_mask]
 
         # ── New-voxel gate — skip already-meshed cells ────────────────
-        TRACK = self.TRACK_VOXEL
+        TRACK = self.TRACK_VOXEL   # 0.05 m — finer than old 0.08 m
         P1, P2 = np.int64(1_000_003), np.int64(1_000_033)
         vk     = np.floor(bpa_xyz / TRACK).astype(np.int64)
         packed = (vk[:, 0] * P1 + vk[:, 1] * P2 + vk[:, 2]).astype(np.int64)
@@ -1050,8 +1173,59 @@ class SLAMAvoidanceRobot:
             self._mesh_building = False
             return
         new_voxel_keys = np.unique(packed[is_new])
-        bpa_xyz   = bpa_xyz[is_new]
-        bpa_depth = bpa_depth[is_new]
+
+        # ── Build expanded region: new voxels + 1-cell border ─────────
+        # Border provides context points so BPA stitches cleanly to
+        # existing geometry — no seam gaps at patch boundaries.
+        unique_new_vk = np.unique(vk[is_new], axis=0)   # M×3
+        ofs = np.array([[a, b, c]
+                        for a in (-1, 0, 1)
+                        for b in (-1, 0, 1)
+                        for c in (-1, 0, 1)], dtype=np.int64)   # 27×3
+        exp        = (unique_new_vk[:, None, :] + ofs[None, :, :]).reshape(-1, 3)
+        exp_packed = (exp[:, 0] * P1 + exp[:, 1] * P2
+                      + exp[:, 2]).astype(np.int64)
+
+        # Include all live-frame points inside the expanded region
+        in_region = np.isin(packed, exp_packed)
+        bpa_xyz   = bpa_xyz[in_region]
+        bpa_depth = bpa_depth[in_region]
+
+        # ── Supplement with accumulated camera map (context density) ──
+        # cam_map_xyz holds ALL past frames merged at MAP_VOXEL resolution.
+        # Adding these points to the new-voxel patch densifies BPA input
+        # and improves normal quality near patch boundaries.
+        # CPython GIL makes attribute reads effectively atomic — safe here.
+        acc_xyz   = self.cam_map_xyz
+        acc_depth = self.cam_map_depth
+        if len(acc_xyz) > 50:
+            acc_xyz   = acc_xyz.copy()
+            acc_depth = acc_depth.copy()
+            na        = acc_depth <= self.MESH_MIN_DIST
+            acc_xyz   = acc_xyz[na].astype(np.float64)
+            acc_depth = acc_depth[na]
+            if len(acc_xyz) > 0:
+                acc_vk = np.floor(acc_xyz / TRACK).astype(np.int64)
+                acc_pk = (acc_vk[:, 0] * P1 + acc_vk[:, 1] * P2
+                          + acc_vk[:, 2]).astype(np.int64)
+                acc_in = np.isin(acc_pk, exp_packed)
+                if acc_in.any():
+                    bpa_xyz   = np.vstack([bpa_xyz,   acc_xyz[acc_in]])
+                    bpa_depth = np.concatenate([bpa_depth, acc_depth[acc_in]])
+
+        if len(bpa_xyz) < 30:
+            self._mesh_building = False
+            return
+
+        # Deduplicate combined live+accumulated source at BPA_VOXEL
+        ds_comb   = voxel_downsample_idx(bpa_xyz.astype(np.float32), BPA_VOXEL)
+        bpa_xyz   = bpa_xyz[ds_comb]
+        bpa_depth = bpa_depth[ds_comb]
+        if len(bpa_xyz) > BPA_MAX:
+            coarser   = BPA_VOXEL * (len(bpa_xyz) / BPA_MAX) ** (1/3)
+            ds3       = voxel_downsample_idx(bpa_xyz.astype(np.float32), float(coarser))
+            bpa_xyz   = bpa_xyz[ds3]
+            bpa_depth = bpa_depth[ds3]
 
         # ── Jet depth colormap ────────────────────────────────────────
         d_min = float(bpa_depth.min()); d_max = float(bpa_depth.max())
@@ -1063,18 +1237,18 @@ class SLAMAvoidanceRobot:
             np.clip(1.5 - np.abs(4*t - 1), 0, 1),
         ], axis=1)
 
-        # ── Build point cloud + two-pass outlier removal ──────────────
+        # ── Point cloud + two-pass outlier removal ────────────────────
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(bpa_xyz)
         pcd.colors = o3d.utility.Vector3dVector(colors)
         if len(bpa_xyz) >= 30:
             pcd, inlier_idx = pcd.remove_statistical_outlier(
-                nb_neighbors=25, std_ratio=2.5)
+                nb_neighbors=20, std_ratio=2.0)   # tighter → cleaner surface
             bpa_xyz   = bpa_xyz[inlier_idx]
             bpa_depth = bpa_depth[inlier_idx]
             if len(bpa_xyz) >= 30:
                 pcd, inlier_idx2 = pcd.remove_radius_outlier(
-                    nb_points=4, radius=0.09)
+                    nb_points=5, radius=0.07)
                 bpa_xyz   = bpa_xyz[inlier_idx2]
                 bpa_depth = bpa_depth[inlier_idx2]
 
@@ -1084,21 +1258,29 @@ class SLAMAvoidanceRobot:
 
         # ── Normal estimation ─────────────────────────────────────────
         nn_dists    = np.asarray(pcd.compute_nearest_neighbor_distance())
-        mean_d      = float(np.median(nn_dists)) if len(nn_dists) > 0 else 0.05
-        mean_d      = float(np.clip(mean_d, 0.012, 0.10))
-        norm_radius = float(np.clip(mean_d * 8.0, 0.08, 0.40))
+        mean_d      = float(np.median(nn_dists)) if len(nn_dists) > 0 else 0.04
+        mean_d      = float(np.clip(mean_d, 0.008, 0.08))
+        norm_radius = float(np.clip(mean_d * 10.0, 0.06, 0.40))
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=norm_radius, max_nn=75))
+                radius=norm_radius, max_nn=100))
+        # Propagate normal consistency within the local patch first,
+        # then orient all normals toward the camera for correct facing.
+        try:
+            pcd.orient_normals_consistent_tangent_plane(k=25)
+        except Exception:
+            pass
         T_map_cam = (self.T_map_base @ self.T_base_cam).astype(np.float64)
         pcd.orient_normals_towards_camera_location(T_map_cam[:3, 3])
 
-        # ── BPA reconstruction ────────────────────────────────────────
+        # ── BPA reconstruction (5-tier radii) ─────────────────────────
+        # Tier 1: micro-detail   Tier 5: macro gap-fill
         bpa_radii = [
-            mean_d * 1.2,
+            mean_d * 1.0,
             mean_d * 2.0,
             mean_d * 3.5,
-            min(mean_d * 6.5, 0.12),
+            mean_d * 6.0,
+            min(mean_d * 10.0, 0.18),
         ]
         try:
             mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
@@ -1109,7 +1291,7 @@ class SLAMAvoidanceRobot:
             mesh.remove_non_manifold_edges()
             mesh.remove_unreferenced_vertices()
             if len(np.asarray(mesh.vertices)) > 10:
-                mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
+                mesh = mesh.filter_smooth_taubin(number_of_iterations=15)
             mesh.compute_vertex_normals()
         except Exception as e:
             print(f"[Mesh] BPA failed: {e}")
@@ -1126,7 +1308,7 @@ class SLAMAvoidanceRobot:
             new_vcols = np.tile([0.15, 0.75, 0.90], (len(new_verts), 1)).astype(np.float32)
 
         # ── Merge into accumulated mesh ───────────────────────────────
-        MAX_ACC_VERTS = 200_000
+        MAX_ACC_VERTS = 300_000   # increased for full-room coverage
         face_off = len(self._acc_mesh_verts)
         self._acc_mesh_verts  = np.vstack([self._acc_mesh_verts,  new_verts])
         self._acc_mesh_faces  = np.vstack([self._acc_mesh_faces,  new_faces + face_off])
@@ -1139,6 +1321,9 @@ class SLAMAvoidanceRobot:
             self._acc_mesh_faces  = self._acc_mesh_faces[valid] - v_start
             self._acc_mesh_verts  = self._acc_mesh_verts[-keep:]
             self._acc_mesh_colors = self._acc_mesh_colors[-keep:]
+            # Reset voxel tracking so trimmed regions are re-meshed on revisit
+            # (without this, trimmed areas remain permanently unpatched)
+            self._meshed_voxels   = np.empty(0, dtype=np.int64)
 
         self._meshed_voxels = np.union1d(self._meshed_voxels, new_voxel_keys)
 
@@ -1153,7 +1338,7 @@ class SLAMAvoidanceRobot:
             }}
         self._mesh_building = False
         print(f"[Mesh] +{len(new_faces)} tris | total {len(self._acc_mesh_faces)} tris"
-              f" | depth {d_min:.1f}–{d_max:.1f} m")
+              f" | pts {len(bpa_xyz)} | depth {d_min:.1f}–{d_max:.1f} m")
 
     # ── Main loop ─────────────────────────────────────────────────
     def run(self):
