@@ -267,6 +267,17 @@ class SLAMAvoidanceRobot:
         self._last_turn_dir  = 0
         self._turn_persist   = 0
 
+        # ── Enhanced stuck recovery ──
+        # _stuck_escape_lvl  : escalation tier (0=basic, 1=medium, 2=full-spin)
+        #                      reset to 0 after 20 s of clean travel
+        # _last_stuck_escape : monotonic time of the last completed escape so we
+        #                      can measure whether the escape actually worked
+        # _pos_history       : (time, x, y) ring-buffer for displacement-based stuck
+        #                      detection (catches wheel-spin: motors on, no movement)
+        self._stuck_escape_lvl  = 0
+        self._last_stuck_escape = 0.0
+        self._pos_history       = deque(maxlen=80)
+
         # ── Perimeter exploration ──────────────────────────────────
         # Phase 1: stay still for INIT_SCAN_FRAMES to build the initial room map.
         # Phase 2: navigate generated waypoints around the inner edge of the room.
@@ -369,28 +380,122 @@ class SLAMAvoidanceRobot:
             if 0 < r < self.SLOW_SPEED: r = self.SLOW_SPEED
         self._drive(l, r)
 
+    def _update_pos_history(self):
+        """Record current world position for displacement-based stuck detection."""
+        self._pos_history.append((
+            time.time(),
+            float(self.T_map_base[0, 3]),
+            float(self.T_map_base[1, 3]),
+        ))
+
     def _check_stuck(self, fd):
-        self._front_history.append((time.time(), fd))
-        if len(self._front_history) < 20: return False
-        if time.time() - self._front_history[0][0] < self.STUCK_TIMEOUT: return False
-        dists = [d for _, d in self._front_history]
-        avg   = sum(dists) / len(dists)
-        var   = sum((d - avg)**2 for d in dists) / len(dists)
-        if var < 300 and avg < self.CRUISE_DIST:
-            if time.time() - self._last_stuck_time > 5.0:
-                self._last_stuck_time = time.time()
-                self._stuck_count += 1
-                return True
+        """
+        Declare stuck when EITHER condition holds for STUCK_TIMEOUT seconds:
+          1. Front-distance variance < 300 mm²  (robot pinned against a wall)
+          2. Position displacement < 8 cm with motors active  (wheel spin / high-centre)
+
+        Resets escalation level after 20 s of successful movement since the last escape.
+        """
+        now = time.time()
+        self._front_history.append((now, fd))
+
+        # Reset escape escalation after sustained clean travel
+        if (self._last_stuck_escape > 0
+                and now - self._last_stuck_escape > 20.0
+                and self._stuck_escape_lvl > 0):
+            self._stuck_escape_lvl = 0
+
+        if len(self._front_history) < 20:
+            return False
+        if now - self._front_history[0][0] < self.STUCK_TIMEOUT:
+            return False
+
+        # Method 1 — front-distance variance (original pinned-against-wall check)
+        dists      = [d for _, d in self._front_history]
+        avg        = sum(dists) / len(dists)
+        var        = sum((d - avg) ** 2 for d in dists) / len(dists)
+        dist_stuck = var < 300 and avg < self.CRUISE_DIST
+
+        # Method 2 — position displacement (catches wheel-spin / high-centred)
+        pos_stuck = False
+        if len(self._pos_history) >= 20:
+            old = [(t, x, y) for t, x, y in self._pos_history
+                   if now - t >= self.STUCK_TIMEOUT]
+            if old:
+                _t0, x0, y0 = old[0]
+                xn = float(self.T_map_base[0, 3])
+                yn = float(self.T_map_base[1, 3])
+                moved = math.hypot(xn - x0, yn - y0)
+                motors_active = abs(self.current_l) > 0 or abs(self.current_r) > 0
+                if motors_active and moved < 0.08:   # < 8 cm in STUCK_TIMEOUT
+                    pos_stuck = True
+
+        if (dist_stuck or pos_stuck) and now - self._last_stuck_time > 5.0:
+            reason = ("pos" if pos_stuck else "dist")
+            print(f"\n[STUCK] Detected ({reason}) count={self._stuck_count + 1} "
+                  f"lvl={self._stuck_escape_lvl}")
+            self._last_stuck_time = now
+            self._stuck_count    += 1
+            return True
         return False
 
     def _unstuck(self):
+        """
+        Three-level escalating escape:
+          Level 0 — basic   : short reverse + small random turn
+          Level 1 — medium  : longer reverse + turn opposite to last attempt
+          Level 2 — full    : long reverse + 180° spin + forward nudge
+
+        Back-blocked check: if BACK zone is too close, skip reversing and spin in place.
+        Level is reset to 0 by _check_stuck after 20 s of clean travel.
+        """
         self.state = "UNSTUCK"
-        self._drive(-self.REVERSE_SPEED, -self.REVERSE_SPEED)
-        time.sleep(self.REVERSE_TIME * 1.5)
-        d = random.choice([-1, 1])
-        self._drive(d * self.TURN_SPEED, -d * self.TURN_SPEED)
-        time.sleep(0.5 + random.random() * 0.8)
+        zones      = self.lidar.get_zone_distances()
+        back_clear = zones.get("BACK", 9999) > (self.STOP_DIST + 100)
+        lvl        = min(self._stuck_escape_lvl, 2)
+        print(f"[STUCK] Escape level {lvl} | back_clear={back_clear}")
+
+        if lvl == 0:
+            # ── Level 0: short reverse + random turn ──────────────────
+            if back_clear:
+                self.state_detail = "reverse"
+                self._drive(-self.REVERSE_SPEED, -self.REVERSE_SPEED)
+                time.sleep(self.REVERSE_TIME * 1.5)
+            d = random.choice([-1, 1])
+            self.state_detail = f"turn {'R' if d > 0 else 'L'}"
+            self._drive(d * self.TURN_SPEED, -d * self.TURN_SPEED)
+            time.sleep(0.5 + random.random() * 0.5)
+
+        elif lvl == 1:
+            # ── Level 1: longer reverse + opposite turn direction ──────
+            if back_clear:
+                self.state_detail = "reverse×2"
+                self._drive(-self.REVERSE_SPEED, -self.REVERSE_SPEED)
+                time.sleep(self.REVERSE_TIME * 2.5)
+            d = (-self._last_turn_dir) if self._last_turn_dir else random.choice([-1, 1])
+            self.state_detail = f"bigturn {'R' if d > 0 else 'L'}"
+            self._drive(d * self.TURN_SPEED, -d * self.TURN_SPEED)
+            time.sleep(1.2 + random.random() * 0.6)
+
+        else:
+            # ── Level 2: full escape — long reverse + ~180° spin + nudge
+            if back_clear:
+                self.state_detail = "escape-rev"
+                self._drive(-self.REVERSE_SPEED, -self.REVERSE_SPEED)
+                time.sleep(self.REVERSE_TIME * 3.5)
+            d = (-self._last_turn_dir) if self._last_turn_dir else random.choice([-1, 1])
+            self.state_detail = "escape-spin"
+            self._drive(d * self.TURN_SPEED, -d * self.TURN_SPEED)
+            time.sleep(2.2)          # ~180° at TURN_SPEED
+            self.state_detail = "escape-fwd"
+            self._drive(self.SLOW_SPEED, self.SLOW_SPEED)
+            time.sleep(0.8)
+
+        self._last_turn_dir    = d if lvl > 0 else getattr(self, '_last_turn_dir', 0)
+        self._stuck_escape_lvl += 1
+        self._last_stuck_escape = time.time()
         self._front_history.clear()
+        self._pos_history.clear()
 
     # ── LiDAR scan motion de-skew ─────────────────────────────────
     def _deskew_scan(self, scan_dict, omega_z, T_scan):
@@ -848,6 +953,9 @@ class SLAMAvoidanceRobot:
                 and self._live_frame_xyz is not None):
             self._mesh_building = True
             threading.Thread(target=self._rebuild_mesh, daemon=True).start()
+
+        # Position history — used by displacement-based stuck detection
+        self._update_pos_history()
 
         return scan, imu_data, cam_img
 
