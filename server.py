@@ -56,6 +56,21 @@ class DashHandler(SimpleHTTPRequestHandler):
             else:
                 self.send_response(204); self.end_headers()
 
+        elif self.path == '/depth':
+            jpeg = _robot.get_cam_depth_jpeg() if _robot else None
+            if jpeg:
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                try:
+                    self.wfile.write(jpeg)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                self.send_response(204); self.end_headers()
+
         elif self.path == '/stream3d':
             # Serve pre-serialised payload built by the mapping loop
             payload = _robot.get_stream3d_bytes() if _robot else b'{}'

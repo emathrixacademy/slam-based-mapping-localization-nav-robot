@@ -288,7 +288,8 @@ class SLAMAvoidanceRobot:
         # ── Dashboard buffers ──
         self._dash_data  = {}; self._dash_lock  = threading.Lock()
         self._occ_grid   = None; self._occ_lock = threading.Lock()
-        self._cam_jpeg   = None; self._cam_lock = threading.Lock()
+        self._cam_jpeg   = None; self._cam_lock   = threading.Lock()
+        self._depth_jpeg = None; self._depth_lock = threading.Lock()
         self._map3d_data = None; self._map3d_lock = threading.Lock()
 
         # ── Mesh reconstruction buffer ──
@@ -820,6 +821,23 @@ class SLAMAvoidanceRobot:
             except Exception:
                 pass
 
+        # Depth JPEG — colorize depth_m (float32 metres) with jet colormap.
+        # depth_m may be at decimated resolution (320×240 after magnitude=2 filter).
+        # Pixels with no depth reading (<5 cm) are rendered black.
+        if depth_m is not None:
+            try:
+                _import_cv2()
+                from config import cv2 as _cv2, np as _np
+                _d = _np.clip(depth_m, 0.0, self.camera.max_depth)
+                _d_norm = (_d / self.camera.max_depth * 255).astype(_np.uint8)
+                _colored = _cv2.applyColorMap(_d_norm, _cv2.COLORMAP_JET)
+                _colored[depth_m < 0.05] = 0   # no-data pixels → black
+                _, _buf = _cv2.imencode('.jpg', _colored, [_cv2.IMWRITE_JPEG_QUALITY, 65])
+                with self._depth_lock:
+                    self._depth_jpeg = _buf.tobytes()
+            except Exception:
+                pass
+
         # 3-D dashboard data
         if self.frame_count % 15 == 0:
             self._prepare_3d_dashboard_data()
@@ -1047,6 +1065,8 @@ class SLAMAvoidanceRobot:
         with self._occ_lock:    return self._occ_grid
     def get_cam_jpeg(self):
         with self._cam_lock:    return self._cam_jpeg
+    def get_cam_depth_jpeg(self):
+        with self._depth_lock: return self._depth_jpeg
     def get_map3d(self):
         with self._map3d_lock:  return self._map3d_data
 
